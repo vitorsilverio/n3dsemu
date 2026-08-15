@@ -9,7 +9,11 @@ import dev.vitorsilverio.armjitter.jit.JitRuntime;
 import dev.vitorsilverio.armjitter.jit.JitRuntimeFactory;
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.n3dsemu.core.N3dsCp15;
+import dev.vitorsilverio.n3dsemu.kernel.HandleTable;
+import dev.vitorsilverio.n3dsemu.kernel.MemoryManager;
+import dev.vitorsilverio.n3dsemu.kernel.ProcessObject;
 import dev.vitorsilverio.n3dsemu.kernel.SvcTable;
+import dev.vitorsilverio.n3dsemu.kernel.ThreadObject;
 import dev.vitorsilverio.n3dsemu.loader.Image3dsx;
 import dev.vitorsilverio.n3dsemu.memory.MemoryMap;
 import dev.vitorsilverio.n3dsemu.memory.N3dsAddressSpace;
@@ -32,6 +36,12 @@ public final class N3dsMachine {
     public static final int RUN_SLICE_BLOCKS = 256;
 
     private static final int REGISTER_SP = 13;
+
+    /// Identificadores plausíveis fixos do único processo/thread do guest (RFC-N3DSEMU G2 PR1:
+    /// sem `svcCreateProcess`/`svcCreateThread` reais ainda) — ver {@link ProcessObject}/
+    /// {@link ThreadObject}.
+    private static final int MAIN_PROCESS_ID = 0;
+    private static final int MAIN_THREAD_ID = 1;
 
     /// Ponteiro inicial de pilha (placeholder do esqueleto — RFC D2/D1: sem `svcCreateThread`
     /// real ainda, isso é G2). Usa o topo da região do heap "novo" (`MemoryMap.NEW_HEAP_BASE`
@@ -70,7 +80,12 @@ public final class N3dsMachine {
                     JitRuntimeFactory.divergenceCheckingArmThumb(BLOCK_CACHE_ENTRIES, HOT_THRESHOLD, architecture);
         };
 
-        SvcTable svcTable = new SvcTable(memory, diagnosticLog, traceSvc);
+        HandleTable handles = new HandleTable(new ProcessObject(MAIN_PROCESS_ID), new ThreadObject(MAIN_THREAD_ID));
+        MemoryManager memoryManager = new MemoryManager(
+                MemoryMap.EXECUTABLE_BASE, paddedExecutableSize(image),
+                MemoryMap.LINEAR_HEAP_BASE, MemoryMap.LINEAR_HEAP_SIZE,
+                MemoryMap.NEW_HEAP_BASE, MemoryMap.NEW_HEAP_SIZE);
+        SvcTable svcTable = new SvcTable(memory, diagnosticLog, traceSvc, handles, memoryManager);
         ArmCore core = new ArmCore(memory, svcTable.dispatcher(), architecture);
         svcTable.attach(core);
         // RFC D1: monitor de exclusividade COMPARTILHADO instalado desde já, mesmo com um só
@@ -101,5 +116,14 @@ public final class N3dsMachine {
 
     public SvcTable svcTable() {
         return svcTable;
+    }
+
+    // Mesmo arredondamento de N3dsAddressSpace#buildExecutableImage (PagedAddressSpace exige
+    // backing múltiplo de pageSize) — repetido aqui porque o MemoryManager (contabilidade de
+    // svcControlMemory/svcQueryMemory) precisa saber o tamanho da região CODE já registrada no
+    // barramento, sem acoplar as duas classes por um método package-private cruzado.
+    private static int paddedExecutableSize(Image3dsx image) {
+        int rawSize = image.totalSize();
+        return (rawSize + MemoryMap.PAGE_SIZE - 1) & ~(MemoryMap.PAGE_SIZE - 1);
     }
 }

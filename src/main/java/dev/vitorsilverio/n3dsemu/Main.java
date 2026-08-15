@@ -1,5 +1,6 @@
 package dev.vitorsilverio.n3dsemu;
 
+import dev.vitorsilverio.n3dsemu.kernel.KernelHaltException;
 import dev.vitorsilverio.n3dsemu.kernel.SvcCall;
 import dev.vitorsilverio.n3dsemu.kernel.UnsupportedSvcException;
 import dev.vitorsilverio.n3dsemu.loader.Bad3dsxException;
@@ -32,6 +33,12 @@ public final class Main {
     private static final int EXIT_NO_SVC_IMPLEMENTED = 3;
     private static final int EXIT_USAGE_ERROR = 2;
     private static final int EXIT_BAD_3DSX = 2;
+
+    /// `svcExitProcess` (G2 PR1): saída limpa — o critério de aceite do marco M2 desta sessão.
+    private static final int EXIT_PROCESS_EXIT = 0;
+    /// `svcBreak` (G2 PR1): o guest pediu para parar com um diagnóstico — não é "svc não
+    /// implementada" (código 3), é um ponto de parada intencional do próprio guest.
+    private static final int EXIT_GUEST_BREAK = 4;
 
     private Main() {
     }
@@ -80,6 +87,20 @@ public final class Main {
             } catch (UnsupportedSvcException e) {
                 // Ver Javadoc da classe: PC já avançou, seguir para a próxima fatia deixa a
                 // execução continuar em vez de travar na primeira svc.
+            } catch (KernelHaltException e) {
+                printTrace(machine.svcTable().recentCalls());
+                int exitCode = switch (e.reason()) {
+                    case PROCESS_EXIT -> {
+                        System.out.println("n3dsemu: " + e.getMessage() + " — saindo com sucesso.");
+                        yield EXIT_PROCESS_EXIT;
+                    }
+                    case GUEST_BREAK -> {
+                        System.err.println("n3dsemu: " + e.getMessage());
+                        yield EXIT_GUEST_BREAK;
+                    }
+                };
+                System.exit(exitCode);
+                return;
             } catch (RuntimeException e) {
                 // Nenhuma svc é implementada de verdade (RFC D2): "devolver sucesso e não
                 // fazer nada" faz o guest seguir por um caminho que o resto do host não
