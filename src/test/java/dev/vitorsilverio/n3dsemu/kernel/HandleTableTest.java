@@ -7,14 +7,21 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class HandleTableTest {
     private static final int PROCESS_ID = 7;
     private static final int THREAD_ID = 3;
+    private static final int THREAD_PRIORITY = 0x30;
+
+    // ThreadObject é mutável (G2 PR2, sem equals por valor) — os testes guardam a MESMA
+    // instância passada ao HandleTable e comparam por identidade, não reconstroem um "igual".
+    private ThreadObject mainThread;
 
     private HandleTable newTable() {
-        return new HandleTable(new ProcessObject(PROCESS_ID), new ThreadObject(THREAD_ID));
+        mainThread = ThreadObject.mainThread(THREAD_ID, THREAD_PRIORITY);
+        return new HandleTable(new ProcessObject(PROCESS_ID), mainThread);
     }
 
     @Test
@@ -25,7 +32,7 @@ class HandleTableTest {
         Optional<KernelObject> thread = handles.resolve(HandleTable.CURRENT_THREAD_HANDLE);
 
         assertEquals(new ProcessObject(PROCESS_ID), process.orElseThrow());
-        assertEquals(new ThreadObject(THREAD_ID), thread.orElseThrow());
+        assertSame(mainThread, thread.orElseThrow());
     }
 
     @Test
@@ -89,7 +96,7 @@ class HandleTableTest {
         HandleTable.DuplicateResult duplicate = handles.duplicate(HandleTable.CURRENT_THREAD_HANDLE);
 
         assertTrue(duplicate.result().isSuccess());
-        assertEquals(new ThreadObject(THREAD_ID), handles.resolve(duplicate.handle()).orElseThrow());
+        assertSame(mainThread, handles.resolve(duplicate.handle()).orElseThrow());
         // A cópia é uma handle real: pode ser fechada, diferente do pseudo-handle original.
         assertTrue(handles.close(duplicate.handle()).isSuccess());
     }

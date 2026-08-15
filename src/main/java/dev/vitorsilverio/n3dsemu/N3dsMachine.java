@@ -12,6 +12,7 @@ import dev.vitorsilverio.n3dsemu.core.N3dsCp15;
 import dev.vitorsilverio.n3dsemu.kernel.HandleTable;
 import dev.vitorsilverio.n3dsemu.kernel.MemoryManager;
 import dev.vitorsilverio.n3dsemu.kernel.ProcessObject;
+import dev.vitorsilverio.n3dsemu.kernel.Scheduler;
 import dev.vitorsilverio.n3dsemu.kernel.SvcTable;
 import dev.vitorsilverio.n3dsemu.kernel.ThreadObject;
 import dev.vitorsilverio.n3dsemu.loader.Image3dsx;
@@ -37,17 +38,22 @@ public final class N3dsMachine {
 
     private static final int REGISTER_SP = 13;
 
-    /// Identificadores plausíveis fixos do único processo/thread do guest (RFC-N3DSEMU G2 PR1:
-    /// sem `svcCreateProcess`/`svcCreateThread` reais ainda) — ver {@link ProcessObject}/
+    /// Identificadores plausíveis fixos do único processo/thread principal do guest (RFC-
+    /// N3DSEMU: sem `svcCreateProcess` — RFC D1, um processo só) — ver {@link ProcessObject}/
     /// {@link ThreadObject}.
     private static final int MAIN_PROCESS_ID = 0;
     private static final int MAIN_THREAD_ID = 1;
+    /// Prioridade plausível fixa da thread principal — `0x30`, o valor típico usado por
+    /// aplicativos 3DS reais (menor número = maior prioridade; 3dbrew/observação de binários
+    /// reais, não documentado como uma constante única e oficial).
+    private static final int MAIN_THREAD_PRIORITY = 0x30;
 
-    /// Ponteiro inicial de pilha (placeholder do esqueleto — RFC D2/D1: sem `svcCreateThread`
-    /// real ainda, isso é G2). Usa o topo da região do heap "novo" (`MemoryMap.NEW_HEAP_BASE`
-    /// + `NEW_HEAP_SIZE`, 16 MiB de folga), só para o crt0 do libctru ter uma pilha válida até
-    /// a primeira `svc`. A G2, ao implementar `svcCreateThread`/o handoff real do Horizon,
-    /// deve substituir isto por uma pilha alocada de verdade.
+    /// Ponteiro inicial de pilha da thread PRINCIPAL (placeholder — o Horizon real recebe a
+    /// pilha do processo via `svcCreateProcess`/`Exheader`, fora do escopo desta HLE, RFC D1: um
+    /// processo só, sem `svcCreateProcess`). Usa o topo da região do heap "novo"
+    /// (`MemoryMap.NEW_HEAP_BASE` + `NEW_HEAP_SIZE`, 16 MiB de folga), só para o crt0 do
+    /// libctru ter uma pilha válida. Threads NOVAS (`svcCreateThread`, G2 PR2) recebem a pilha
+    /// que o próprio guest aloca e passa como argumento — não usam este placeholder.
     private static final int INITIAL_STACK_POINTER = MemoryMap.NEW_HEAP_BASE + MemoryMap.NEW_HEAP_SIZE;
 
     private final ArmCore core;
@@ -80,21 +86,28 @@ public final class N3dsMachine {
                     JitRuntimeFactory.divergenceCheckingArmThumb(BLOCK_CACHE_ENTRIES, HOT_THRESHOLD, architecture);
         };
 
-        HandleTable handles = new HandleTable(new ProcessObject(MAIN_PROCESS_ID), new ThreadObject(MAIN_THREAD_ID));
+        ThreadObject mainThread = ThreadObject.mainThread(MAIN_THREAD_ID, MAIN_THREAD_PRIORITY);
+        HandleTable handles = new HandleTable(new ProcessObject(MAIN_PROCESS_ID), mainThread);
         MemoryManager memoryManager = new MemoryManager(
                 MemoryMap.EXECUTABLE_BASE, paddedExecutableSize(image),
                 MemoryMap.LINEAR_HEAP_BASE, MemoryMap.LINEAR_HEAP_SIZE,
                 MemoryMap.NEW_HEAP_BASE, MemoryMap.NEW_HEAP_SIZE);
-        SvcTable svcTable = new SvcTable(memory, diagnosticLog, traceSvc, handles, memoryManager);
+        Scheduler scheduler = new Scheduler();
+        SvcTable svcTable = new SvcTable(memory, diagnosticLog, traceSvc, handles, memoryManager, scheduler);
         ArmCore core = new ArmCore(memory, svcTable.dispatcher(), architecture);
         svcTable.attach(core);
         // RFC D1: monitor de exclusividade COMPARTILHADO instalado desde já, mesmo com um só
         // núcleo — para o segundo núcleo do MPCore entrar depois sem refactor.
         core.setExclusiveMonitor(new ExclusiveMonitor());
-        core.setCoprocessorBus(new N3dsCp15());
+        N3dsCp15 cp15 = new N3dsCp15();
+        core.setCoprocessorBus(cp15);
 
         core.configureExecutionState(image.entryPoint(), CpuMode.USER, InstructionSet.ARM, false, false);
         core.setRegister(REGISTER_SP, INITIAL_STACK_POINTER);
+        // Registra a thread principal (já posicionada acima) como a corrente do escalonador —
+        // depois deste ponto, toda troca de contexto entre threads (G2 PR2) passa pelo
+        // Scheduler, nunca por manipulação direta do ArmCore.
+        scheduler.attach(core, cp15, mainThread);
 
         return new N3dsMachine(core, runtime, svcTable);
     }

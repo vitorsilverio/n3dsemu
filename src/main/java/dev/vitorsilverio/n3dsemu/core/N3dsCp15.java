@@ -9,11 +9,10 @@ import dev.vitorsilverio.armjitter.coprocessor.CoprocessorBus;
 /// A ausência deste registrador foi exatamente a causa raiz do bug que travava todo homebrew
 /// moderno do ndsemu (memória `ndsemu-calico-boot-fix`): o dispatcher de IRQ do runtime
 /// (calico, mesma família do libctru) usa `c13` como scratch e trava esperando por um valor
-/// que nunca chega. Implementado desde o início aqui por precaução — mesmo que o G1 ainda não
-/// crie threads de verdade (só a principal, até a primeira `svc`).
+/// que nunca chega.
 ///
-/// **Sem suporte a múltiplas threads ainda**: um valor só, trocado por
-/// {@link #setThreadLocalStorage} quando a G2 implementar troca de contexto entre threads.
+/// Um valor só, trocado por {@link #setThreadLocalStorage} a cada troca de contexto entre
+/// threads (G2 PR2: `dev.vitorsilverio.n3dsemu.kernel.Scheduler#switchTo`).
 public final class N3dsCp15 implements CoprocessorBus {
     private static final int CP15 = 15;
 

@@ -42,6 +42,20 @@ public record Result(int description, int module, int summary, int level) {
 
     // ── Level (3dbrew: Error_codes, tabela "Level") ─────────────────────────────────────────
     public static final int LEVEL_PERMANENT = 27;
+    public static final int LEVEL_STATUS = 1;
+
+    // ── constantes do código completo de timeout (G2 PR2, ver Javadoc de TIMEOUT) ──────────
+    private static final int DESCRIPTION_TIMEOUT = 1022;
+    private static final int MODULE_OS = 6;
+    private static final int SUMMARY_STATUS_CHANGED = 10;
+
+    /// Placeholder de descrição para "quem chamou não é o dono" (`svcReleaseMutex` sobre um
+    /// mutex de outra thread) — reutiliza `SUMMARY_INVALID_ARGUMENT`/`LEVEL_PERMANENT`, mesmo
+    /// padrão dos outros erros de uso indevido desta classe (`INVALID_HANDLE`/
+    /// `INVALID_ENUM_VALUE`). **Valor de `description` não confirmado contra o 3dbrew nesta
+    /// sessão** (sem acesso à wiki) — ao contrário de `TIMEOUT` abaixo, que foi decomposto de um
+    /// código completo real conhecido.
+    private static final int DESCRIPTION_NOT_LOCK_OWNER_PLACEHOLDER = 1016;
 
     /// `0` — nenhum campo setado. É o único valor de sucesso possível: qualquer campo
     /// diferente de zero torna o código um erro (ver {@link #isSuccess()}).
@@ -77,6 +91,20 @@ public record Result(int description, int module, int summary, int level) {
     /// {@link MemoryManager}).
     public static final Result MEMORY_REGION_NOT_FOUND =
             new Result(DESCRIPTION_NOT_FOUND, MODULE_KERNEL, SUMMARY_NOT_FOUND, LEVEL_PERMANENT);
+
+    /// `svcWaitSynchronization*`/`svcArbitrateAddress` expirou sem sincronizar. **Único código
+    /// desta classe reconstruído a partir de um código completo REAL conhecido** (`0x09401BFE`,
+    /// amplamente documentado como o "Result timeout" do Horizon) em vez de montado a partir da
+    /// tabela "Description" do 3dbrew — decomposição verificada bit a bit (description=1022,
+    /// module=6, summary=10, level=1) e reconstrói exatamente `0x09401BFE` de volta via
+    /// {@link #code()}.
+    public static final Result TIMEOUT =
+            new Result(DESCRIPTION_TIMEOUT, MODULE_OS, SUMMARY_STATUS_CHANGED, LEVEL_STATUS);
+
+    /// `svcReleaseMutex` chamado por uma thread que não é a dona atual (ver Javadoc do campo
+    /// `DESCRIPTION_NOT_LOCK_OWNER_PLACEHOLDER` acima).
+    public static final Result NOT_LOCK_OWNER =
+            new Result(DESCRIPTION_NOT_LOCK_OWNER_PLACEHOLDER, MODULE_KERNEL, SUMMARY_INVALID_ARGUMENT, LEVEL_PERMANENT);
 
     /// Empacota os quatro campos no `u32` que vai para `r0`.
     public int code() {

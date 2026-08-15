@@ -4,6 +4,7 @@ import dev.vitorsilverio.armjitter.arch.ArmArchitecture;
 import dev.vitorsilverio.armjitter.core.ArmCore;
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.armjitter.swi.CpuState;
+import dev.vitorsilverio.n3dsemu.core.N3dsCp15;
 import dev.vitorsilverio.n3dsemu.memory.LoggingOpenBus;
 import org.junit.jupiter.api.Test;
 
@@ -33,6 +34,7 @@ class SvcTableTest {
     private static final int NEW_HEAP_SIZE = 2 * PAGE_SIZE;
     private static final int MAIN_PROCESS_ID = 5;
     private static final int MAIN_THREAD_ID = 1;
+    private static final int MAIN_THREAD_PRIORITY = 0x30;
 
     // Codificação real de `svc #imm` em modo ARM (condição AL=0xE): confirmado via
     // `arm-none-eabi-objdump -d libctru.a` — `svc 0x01` monta como `ef000001` (ver Javadoc de
@@ -44,7 +46,8 @@ class SvcTableTest {
     private static final int REGISTER_R5 = 5;
 
     private record Harness(PagedAddressSpace memory, ArmCore core, SvcTable svcTable,
-                            HandleTable handles, ByteArrayOutputStream stdout) {
+                            HandleTable handles, Scheduler scheduler, ThreadObject mainThread,
+                            ByteArrayOutputStream stdout) {
     }
 
     private Harness newHarness() {
@@ -53,14 +56,21 @@ class SvcTableTest {
         PagedAddressSpace memory = new PagedAddressSpace(PAGE_SHIFT, new LoggingOpenBus(log));
         memory.mapRam(CODE_BASE, new byte[PAGE_SIZE]);
         memory.mapRam(DATA_BASE, new byte[PAGE_SIZE]);
+        memory.mapRam(dev.vitorsilverio.n3dsemu.memory.MemoryMap.TLS_BASE,
+                new byte[dev.vitorsilverio.n3dsemu.memory.MemoryMap.TLS_REGION_SIZE]);
 
-        HandleTable handles = new HandleTable(new ProcessObject(MAIN_PROCESS_ID), new ThreadObject(MAIN_THREAD_ID));
+        ThreadObject mainThread = ThreadObject.mainThread(MAIN_THREAD_ID, MAIN_THREAD_PRIORITY);
+        HandleTable handles = new HandleTable(new ProcessObject(MAIN_PROCESS_ID), mainThread);
         MemoryManager memoryManager = new MemoryManager(CODE_BASE, PAGE_SIZE,
                 LINEAR_HEAP_BASE, LINEAR_HEAP_SIZE, NEW_HEAP_BASE, NEW_HEAP_SIZE);
-        SvcTable svcTable = new SvcTable(memory, log, false, handles, memoryManager);
+        Scheduler scheduler = new Scheduler();
+        SvcTable svcTable = new SvcTable(memory, log, false, handles, memoryManager, scheduler);
         ArmCore core = new ArmCore(memory, svcTable.dispatcher(), ArmArchitecture.ARM11_MPCORE);
         svcTable.attach(core);
-        return new Harness(memory, core, svcTable, handles, captured);
+        N3dsCp15 cp15 = new N3dsCp15();
+        core.setCoprocessorBus(cp15);
+        scheduler.attach(core, cp15, mainThread);
+        return new Harness(memory, core, svcTable, handles, scheduler, mainThread, captured);
     }
 
     /// Grava `svc #svcNumber` em `CODE_BASE` e devolve o `CpuState` de entrada correspondente
@@ -228,12 +238,253 @@ class SvcTableTest {
     @Test
     void svcNaoImplementadaContinuaLogandoELancandoComoNaG1() {
         Harness h = newHarness();
-        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x21); // svcCreateAddressArbiter, G2 PR2
+        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x1A); // svcCreateTimer, fora do escopo da G2
         CpuState state = new CpuState(0, 0, 0, 0, 0, 0, CODE_BASE + ARM_INSTRUCTION_SIZE, 0);
 
         UnsupportedSvcException thrown = org.junit.jupiter.api.Assertions.assertThrows(
                 UnsupportedSvcException.class, () -> h.svcTable().dispatcher().dispatch(0, state));
 
-        assertEquals(0x21, thrown.call().number());
+        assertEquals(0x1A, thrown.call().number());
+    }
+
+    // ── G2 PR2: threads, sincronização, AddressArbiter, IPC ─────────────────────────────────
+
+    @Test
+    void createAddressArbiterDevolveUmaHandleValida() {
+        Harness h = newHarness();
+
+        CpuState result = dispatch(h, 0x21, 0, 0, 0, 0);
+
+        assertEquals(Result.SUCCESS.code(), result.r0());
+        assertTrue(h.handles().resolve(result.r1()).orElseThrow() instanceof AddressArbiterObject);
+    }
+
+    @Test
+    void arbitrateAddressSignalSemNinguemEsperandoDevolveSucesso() {
+        Harness h = newHarness();
+        CpuState arbiter = dispatch(h, 0x21, 0, 0, 0, 0);
+        int arbiterHandle = arbiter.r1();
+
+        CpuState result = dispatch(h, 0x22, arbiterHandle, DATA_BASE, ArbitrationType.SIGNAL, 1);
+
+        assertEquals(Result.SUCCESS.code(), result.r0());
+    }
+
+    @Test
+    void arbitrateAddressWaitIfLessThanComCondicaoJaFalsaNaoBloqueia() {
+        Harness h = newHarness();
+        CpuState arbiter = dispatch(h, 0x21, 0, 0, 0, 0);
+        int arbiterHandle = arbiter.r1();
+        h.memory().write32(DATA_BASE, 5);
+
+        CpuState result = dispatch(h, 0x22, arbiterHandle, DATA_BASE, ArbitrationType.WAIT_IF_LESS_THAN, 3);
+
+        assertEquals(Result.SUCCESS.code(), result.r0());
+    }
+
+    @Test
+    void createThreadRegistraUmaThreadNovaProntaESemForcarTroca() {
+        Harness h = newHarness();
+
+        CpuState result = dispatch(h, 0x08, 0x20, CODE_BASE, 0xCAFE, DATA_BASE + PAGE_SIZE / 2);
+
+        assertEquals(Result.SUCCESS.code(), result.r0());
+        assertTrue(h.handles().resolve(result.r1()).orElseThrow() instanceof ThreadObject);
+        // Sem troca de contexto: a thread principal continua sendo a corrente.
+        assertEquals(h.mainThread(), h.scheduler().current());
+    }
+
+    @Test
+    void getSetThreadPriorityDaThreadPrincipal() {
+        Harness h = newHarness();
+
+        CpuState setResult = dispatch(h, 0x0C, HandleTable.CURRENT_THREAD_HANDLE, 0x10, 0, 0);
+        CpuState getResult = dispatch(h, 0x0B, 0, HandleTable.CURRENT_THREAD_HANDLE, 0, 0);
+
+        assertEquals(Result.SUCCESS.code(), setResult.r0());
+        assertEquals(Result.SUCCESS.code(), getResult.r0());
+        assertEquals(0x10, getResult.r1());
+    }
+
+    @Test
+    void createMutexDestravadoPermiteReleaseSemErro() {
+        Harness h = newHarness();
+        CpuState created = dispatch(h, 0x13, 0, 0, 0, 0); // initiallyLocked=false
+        int mutexHandle = created.r1();
+        // Adquire manualmente via WaitSynchronization1 antes de liberar (mutex destravado não
+        // tem dono ainda — svcReleaseMutex sem dono é erro, mesma armadilha da task).
+        dispatch(h, 0x24, mutexHandle, 0, 0, 0);
+
+        CpuState release = dispatch(h, 0x14, mutexHandle, 0, 0, 0);
+
+        assertEquals(Result.SUCCESS.code(), release.r0());
+    }
+
+    @Test
+    void createMutexInicialmenteTravadoTemAThreadCorrenteComoDono() {
+        Harness h = newHarness();
+
+        CpuState created = dispatch(h, 0x13, 0, 1, 0, 0); // initiallyLocked=true
+        CpuState release = dispatch(h, 0x14, created.r1(), 0, 0, 0);
+
+        assertEquals(Result.SUCCESS.code(), release.r0());
+    }
+
+    @Test
+    void createSemaphoreEReleaseDevolveContagemAnterior() {
+        Harness h = newHarness();
+        CpuState created = dispatch(h, 0x15, 0, 0, 3, 0); // initialCount=0, maxCount=3
+        int semaphoreHandle = created.r1();
+
+        CpuState release = dispatch(h, 0x16, 0, semaphoreHandle, 1, 0);
+
+        assertEquals(Result.SUCCESS.code(), release.r0());
+        assertEquals(0, release.r1());
+    }
+
+    @Test
+    void createEventOneshotSignalEWaitSynchronization1DevolveSucessoEConsome() {
+        Harness h = newHarness();
+        CpuState created = dispatch(h, 0x17, 0, ResetType.ONESHOT, 0, 0);
+        int eventHandle = created.r1();
+        dispatch(h, 0x18, eventHandle, 0, 0, 0); // svcSignalEvent
+
+        CpuState wait1 = dispatch(h, 0x24, eventHandle, 0, 0, 0);
+        // Oneshot já consumiu o sinal — uma segunda espera com timeout=0 expira.
+        CpuState wait2 = dispatch(h, 0x24, eventHandle, 0, 0, 0);
+
+        assertEquals(Result.SUCCESS.code(), wait1.r0());
+        assertEquals(Result.TIMEOUT.code(), wait2.r0());
+    }
+
+    @Test
+    void eventStickyPermaneceSinalizadoAteClear() {
+        Harness h = newHarness();
+        CpuState created = dispatch(h, 0x17, 0, ResetType.STICKY, 0, 0);
+        int eventHandle = created.r1();
+        dispatch(h, 0x18, eventHandle, 0, 0, 0);
+
+        CpuState wait1 = dispatch(h, 0x24, eventHandle, 0, 0, 0);
+        CpuState wait2 = dispatch(h, 0x24, eventHandle, 0, 0, 0);
+        dispatch(h, 0x19, eventHandle, 0, 0, 0); // svcClearEvent
+        CpuState wait3 = dispatch(h, 0x24, eventHandle, 0, 0, 0);
+
+        assertEquals(Result.SUCCESS.code(), wait1.r0());
+        assertEquals(Result.SUCCESS.code(), wait2.r0());
+        assertEquals(Result.TIMEOUT.code(), wait3.r0());
+    }
+
+    @Test
+    void waitSynchronization1ComTimeoutZeroENadaDisponivelDevolveTimeout() {
+        Harness h = newHarness();
+        CpuState created = dispatch(h, 0x15, 0, 0, 1, 0); // semáforo vazio
+
+        CpuState result = dispatch(h, 0x24, created.r1(), 0, 0, 0);
+
+        assertEquals(Result.TIMEOUT.code(), result.r0());
+    }
+
+    @Test
+    void waitSynchronizationNWaitAnyDevolveIndiceDoObjetoSinalizado() {
+        Harness h = newHarness();
+        CpuState semaphore = dispatch(h, 0x15, 0, 0, 1, 0); // vazio, não disponível
+        CpuState event = dispatch(h, 0x17, 0, ResetType.STICKY, 0, 0);
+        dispatch(h, 0x18, event.r1(), 0, 0, 0);
+
+        h.memory().write32(DATA_BASE, semaphore.r1());
+        h.memory().write32(DATA_BASE + 4, event.r1());
+        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x25);
+        CpuState state = new CpuState(0, DATA_BASE, 2, 0 /* waitAll=false */,
+                0, 0, CODE_BASE + ARM_INSTRUCTION_SIZE, 0);
+        CpuState result = h.svcTable().dispatcher().dispatch(0, state);
+
+        assertEquals(Result.SUCCESS.code(), result.r0());
+        assertEquals(1, result.r1()); // índice 1 = o evento, o único disponível
+    }
+
+    @Test
+    void waitSynchronizationNWaitAllSoResolveQuandoTodosDisponiveis() {
+        Harness h = newHarness();
+        CpuState semaphore = dispatch(h, 0x15, 0, 0, 1, 0); // vazio
+        CpuState event = dispatch(h, 0x17, 0, ResetType.STICKY, 0, 0);
+        dispatch(h, 0x18, event.r1(), 0, 0, 0); // evento já sinalizado, semáforo ainda não
+
+        h.memory().write32(DATA_BASE, semaphore.r1());
+        h.memory().write32(DATA_BASE + 4, event.r1());
+        CpuState waitAllState = new CpuState(0, DATA_BASE, 2, 1 /* waitAll=true */,
+                0, 0, CODE_BASE + ARM_INSTRUCTION_SIZE, 0);
+
+        // `dispatch(...)` reescreve CODE_BASE com o opcode svc da chamada que ele mesmo faz —
+        // cada disparo manual do WaitSynchronizationN precisa reescrever 0x25 de volta antes,
+        // já que `realSvcNumber` relê a instrução crua da memória (ver Javadoc de SvcTable).
+        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x25);
+        CpuState notYet = h.svcTable().dispatcher().dispatch(0, waitAllState);
+        // Nem tudo disponível ainda (semáforo vazio) e timeout=0 — expira sem sincronizar.
+        assertEquals(Result.TIMEOUT.code(), notYet.r0());
+
+        dispatch(h, 0x16, 0, semaphore.r1(), 1, 0); // libera o semáforo
+        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x25);
+        CpuState nowReady = h.svcTable().dispatcher().dispatch(0, waitAllState);
+        assertEquals(Result.SUCCESS.code(), nowReady.r0());
+    }
+
+    @Test
+    void connectToPortDevolveUmaSessaoComONomeLido() {
+        Harness h = newHarness();
+        String portName = "srv:";
+        byte[] bytes = portName.getBytes(StandardCharsets.UTF_8);
+        for (int i = 0; i < bytes.length; i++) {
+            h.memory().write8(DATA_BASE + i, bytes[i]);
+        }
+        h.memory().write8(DATA_BASE + bytes.length, (byte) 0);
+
+        CpuState result = dispatch(h, 0x2D, 0, DATA_BASE, 0, 0);
+
+        assertEquals(Result.SUCCESS.code(), result.r0());
+        assertEquals(new SessionObject(portName), h.handles().resolve(result.r1()).orElseThrow());
+    }
+
+    @Test
+    void sendSyncRequestLogaOCabecalhoIpcELanca() {
+        Harness h = newHarness();
+        CpuState session = dispatch(h, 0x2D, 0, DATA_BASE, 0, 0); // porta vazia, sem nome escrito
+        int tls = h.mainThread().tlsAddress();
+        int header = (0x1234 << 16); // comando 0x1234, 0 params
+        h.memory().write32(tls + dev.vitorsilverio.n3dsemu.memory.MemoryMap.TLS_COMMAND_BUFFER_OFFSET, header);
+
+        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x32);
+        CpuState state = new CpuState(session.r1(), 0, 0, 0, 0, 0, CODE_BASE + ARM_INSTRUCTION_SIZE, 0);
+
+        UnsupportedSvcException thrown = org.junit.jupiter.api.Assertions.assertThrows(
+                UnsupportedSvcException.class, () -> h.svcTable().dispatcher().dispatch(0, state));
+
+        assertEquals(0x32, thrown.call().number());
+        assertTrue(h.stdout().toString(StandardCharsets.UTF_8).contains("0x1234"));
+    }
+
+    @Test
+    void sleepThreadComZeroCedeAExecucaoESeguraDeVoltaParaAMesmaThreadUnica() {
+        Harness h = newHarness();
+
+        CpuState result = dispatch(h, 0x0A, 0, 0, 0, 0);
+
+        // Nenhuma outra thread pronta: a própria thread principal é escolhida de volta —
+        // não há deadlock nem NPE de contexto salvo ausente (ver Javadoc de
+        // Scheduler#switchTo).
+        assertEquals(h.mainThread(), h.scheduler().current());
+        assertEquals(ThreadObject.State.RUNNING, h.mainThread().state());
+        org.junit.jupiter.api.Assertions.assertNotNull(result);
+    }
+
+    @Test
+    void sleepThreadComTimeoutAdiantaORelogioVirtualEAcordaSozinha() {
+        Harness h = newHarness();
+        long before = h.core().cycles();
+
+        dispatch(h, 0x0A, 1_000_000, 0, 0, 0); // 1 ms
+
+        assertEquals(h.mainThread(), h.scheduler().current());
+        assertEquals(ThreadObject.State.RUNNING, h.mainThread().state());
+        org.junit.jupiter.api.Assertions.assertTrue(h.core().cycles() > before);
     }
 }

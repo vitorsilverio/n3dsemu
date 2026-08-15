@@ -55,4 +55,20 @@ public final class MemoryMap {
     /// regiões acima já nascem alinhadas a isso).
     public static final int PAGE_SHIFT = 12;
     public static final int PAGE_SIZE = 1 << PAGE_SHIFT;
+
+    /// TLS (Thread Local Storage) por thread — RFC §3: "TLS de cada thread... fica em páginas
+    /// alocadas pelo host". Sem endereço fixado pela RFC/3dbrew para esta HLE (no Horizon real
+    /// fica embutido no espaço "static" que a MMU aloca dinamicamente); posicionado no vão
+    /// livre entre a Shared Page e a FCRAM (RFC-N3DSEMU G2 PR2). O primeiro slot é sempre da
+    /// thread principal (ver {@link dev.vitorsilverio.n3dsemu.kernel.ThreadObject#mainThread}).
+    public static final int TLS_BASE = 0x1FF9_0000;
+    /// Tamanho de uma página de TLS — inclui o buffer de comando IPC em
+    /// {@link #TLS_COMMAND_BUFFER_OFFSET}.
+    public static final int TLS_SLOT_SIZE = PAGE_SIZE;
+    /// Quantas threads simultâneas esta HLE sustenta (`svcCreateThread` além disso falha com
+    /// {@code Result.OUT_OF_MEMORY}) — generoso para qualquer homebrew do corpus desta task.
+    public static final int TLS_MAX_THREADS = 64;
+    public static final int TLS_REGION_SIZE = TLS_SLOT_SIZE * TLS_MAX_THREADS;
+    /// Deslocamento do buffer de comando IPC dentro da página de TLS de uma thread (RFC §3).
+    public static final int TLS_COMMAND_BUFFER_OFFSET = 0x80;
 }

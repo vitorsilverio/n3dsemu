@@ -26,6 +26,7 @@ public final class N3dsAddressSpace {
         memory.mapRam(MemoryMap.DSP_RAM_BASE, new byte[MemoryMap.DSP_RAM_SIZE]);
         memory.mapHandler(MemoryMap.CONFIG_MEMORY_BASE, MemoryMap.CONFIG_MEMORY_SIZE, ConfigMemory.create());
         memory.mapHandler(MemoryMap.SHARED_PAGE_BASE, MemoryMap.SHARED_PAGE_SIZE, SharedPage.create());
+        memory.mapRam(MemoryMap.TLS_BASE, new byte[MemoryMap.TLS_REGION_SIZE]);
         memory.mapRam(MemoryMap.FCRAM_BASE, new byte[MemoryMap.FCRAM_SIZE]);
 
         return memory;
