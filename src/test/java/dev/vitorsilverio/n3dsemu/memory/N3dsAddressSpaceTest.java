@@ -32,7 +32,7 @@ class N3dsAddressSpaceTest {
     void ramComumLeEEscreve() {
         PagedAddressSpace memory = N3dsAddressSpace.create(tinyImage(), System.out);
         for (int base : new int[]{
-                MemoryMap.LINEAR_HEAP_BASE, MemoryMap.NEW_HEAP_BASE,
+                MemoryMap.GENERAL_HEAP_BASE, MemoryMap.LINEAR_HEAP_BASE,
                 MemoryMap.VRAM_BASE, MemoryMap.DSP_RAM_BASE, MemoryMap.FCRAM_BASE}) {
             memory.write32(base, 0xDEADBEEF);
             assertEquals(0xDEADBEEF, memory.read32(base));

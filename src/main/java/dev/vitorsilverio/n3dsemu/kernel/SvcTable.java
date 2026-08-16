@@ -102,6 +102,15 @@ public final class SvcTable {
     private static final int SVC_GET_PROCESS_ID = 0x35;
     private static final int SVC_GET_THREAD_ID = 0x37;
     private static final int SVC_GET_RESOURCE_LIMIT = 0x38;
+    // 0x39 (svcGetResourceLimitLimitValues) não está na lista de SVCs da task original — mesmo
+    // achado real de svcCreateAddressArbiter (ver Javadoc da classe): o crt0/libctru chama esta
+    // SVC ANTES de svcGetResourceLimitCurrentValues, no mesmo trecho de __system_allocateHeaps,
+    // para descobrir o teto de COMMIT antes de pedir svcControlMemory(MEMOP_ALLOC). Sem ela, o
+    // array de saída fica com o que já estava na pilha do guest (geralmente 0), o tamanho
+    // calculado do heap linear vira 0 e o ALLOC subsequente falha com MISALIGNED_SIZE — é a
+    // causa raiz documentada no `tasks/FILA-EXECUCAO.md` (sessão de investigação 2026-08-16),
+    // não uma SVC "implementada por precaução".
+    private static final int SVC_GET_RESOURCE_LIMIT_LIMIT_VALUES = 0x39;
     private static final int SVC_GET_RESOURCE_LIMIT_CURRENT_VALUES = 0x3A;
     private static final int SVC_BREAK = 0x3C;
     private static final int SVC_OUTPUT_DEBUG_STRING = 0x3D;
@@ -218,6 +227,7 @@ public final class SvcTable {
             case SVC_GET_PROCESS_ID -> handleGetProcessId(state);
             case SVC_GET_THREAD_ID -> handleGetThreadId(state);
             case SVC_GET_RESOURCE_LIMIT -> handleGetResourceLimit(state);
+            case SVC_GET_RESOURCE_LIMIT_LIMIT_VALUES -> handleGetResourceLimitLimitValues(state);
             case SVC_GET_RESOURCE_LIMIT_CURRENT_VALUES -> handleGetResourceLimitCurrentValues(state);
             case SVC_BREAK -> throw handleBreak(state);
             case SVC_OUTPUT_DEBUG_STRING -> handleOutputDebugString(state);
@@ -654,6 +664,33 @@ public final class SvcTable {
         int resourceLimitHandle = handles.create(new ResourceLimitObject(process.processId()));
         return new CpuState(Result.SUCCESS.code(), resourceLimitHandle, state.r2(), state.r3(),
                 state.sp(), state.lr(), state.pc(), state.cpsr());
+    }
+
+    /// `svcGetResourceLimitLimitValues` — mesma convenção de registrador de
+    /// {@link #handleGetResourceLimitCurrentValues} (`r0`=endereço de saída no guest, `r1`=
+    /// handle do `ResourceLimitObject`, `r2`=endereço do array `LimitableResource` no guest,
+    /// `r3`=quantidade de entradas) — a assinatura C (`svcGetResourceLimitLimitValues(s64*,
+    /// Handle, LimitableResource*, s32)`) é idêntica em forma à de `CurrentValues`, só troca
+    /// "uso atual" por "teto configurado". Ver Javadoc de {@link #SVC_GET_RESOURCE_LIMIT_LIMIT_VALUES}
+    /// para o porquê desta SVC (fora da lista original da task) ser necessária.
+    private CpuState handleGetResourceLimitLimitValues(CpuState state) {
+        int valuesOutAddress = state.r0();
+        int resourceLimitHandle = state.r1();
+        int namesAddress = state.r2();
+        int nameCount = state.r3();
+
+        Optional<KernelObject> object = handles.resolve(resourceLimitHandle);
+        if (object.isEmpty() || !(object.get() instanceof ResourceLimitObject)) {
+            return state.withR0(Result.INVALID_HANDLE.code());
+        }
+        for (int i = 0; i < nameCount; i++) {
+            int resource = memory.read32(namesAddress + i * BYTES_PER_S32);
+            long value = ResourceLimitValues.limitValueOf(resource);
+            int valueAddress = valuesOutAddress + i * BYTES_PER_S64;
+            memory.write32(valueAddress, (int) (value >>> LONG_LOW_WORD_SHIFT));
+            memory.write32(valueAddress + BYTES_PER_S32, (int) (value >>> LONG_HIGH_WORD_SHIFT));
+        }
+        return state.withR0(Result.SUCCESS.code());
     }
 
     /// `svcGetResourceLimitCurrentValues` — kernel real (sem wrapper de registradores, a

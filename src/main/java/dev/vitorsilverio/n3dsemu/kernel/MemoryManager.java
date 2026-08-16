@@ -9,7 +9,7 @@ import java.util.TreeMap;
 /// Contabilidade de `svcControlMemory`/`svcQueryMemory` (RFC-N3DSEMU G2): **não há MMU** (RFC
 /// D2) — toda a memória que este gerente rastreia já está fisicamente mapeada e com backing real
 /// em `dev.vitorsilverio.n3dsemu.memory.N3dsAddressSpace` desde o boot. "Alocar" aqui é só
-/// escolher/reservar uma sub-faixa livre dentro do heap linear ou do heap novo e anotar seu
+/// escolher/reservar uma sub-faixa livre dentro do heap geral ou do heap linear e anotar seu
 /// estado/permissão; nenhum byte de memória é tocado, nenhuma página é remapeada de verdade.
 ///
 /// Todos os endereços usados neste projeto (`MemoryMap`) são menores que `0x8000_0000`, então a
@@ -17,25 +17,25 @@ import java.util.TreeMap;
 /// comparador especial.
 public final class MemoryManager {
     private final TreeMap<Integer, MemoryRegion> regions = new TreeMap<>();
+    private final int generalHeapBase;
+    private final int generalHeapSize;
     private final int linearHeapBase;
     private final int linearHeapSize;
-    private final int newHeapBase;
-    private final int newHeapSize;
 
-    /// @param codeBase       base do executável carregado (marcado {@link MemoryState#CODE} de
-    ///                        largada, para `svcQueryMemory` sobre o próprio código responder algo
-    ///                        plausível mesmo sem nenhuma `svcControlMemory` ainda)
-    /// @param codeSize       tamanho do executável (já arredondado a página pelo chamador)
-    /// @param linearHeapBase {@link MemoryMap#LINEAR_HEAP_BASE}
-    /// @param linearHeapSize {@link MemoryMap#LINEAR_HEAP_SIZE}
-    /// @param newHeapBase    {@link MemoryMap#NEW_HEAP_BASE}
-    /// @param newHeapSize    {@link MemoryMap#NEW_HEAP_SIZE}
-    public MemoryManager(int codeBase, int codeSize, int linearHeapBase, int linearHeapSize,
-                          int newHeapBase, int newHeapSize) {
+    /// @param codeBase        base do executável carregado (marcado {@link MemoryState#CODE} de
+    ///                         largada, para `svcQueryMemory` sobre o próprio código responder algo
+    ///                         plausível mesmo sem nenhuma `svcControlMemory` ainda)
+    /// @param codeSize        tamanho do executável (já arredondado a página pelo chamador)
+    /// @param generalHeapBase {@link MemoryMap#GENERAL_HEAP_BASE}
+    /// @param generalHeapSize {@link MemoryMap#GENERAL_HEAP_SIZE}
+    /// @param linearHeapBase  {@link MemoryMap#LINEAR_HEAP_BASE}
+    /// @param linearHeapSize  {@link MemoryMap#LINEAR_HEAP_SIZE}
+    public MemoryManager(int codeBase, int codeSize, int generalHeapBase, int generalHeapSize,
+                          int linearHeapBase, int linearHeapSize) {
+        this.generalHeapBase = generalHeapBase;
+        this.generalHeapSize = generalHeapSize;
         this.linearHeapBase = linearHeapBase;
         this.linearHeapSize = linearHeapSize;
-        this.newHeapBase = newHeapBase;
-        this.newHeapSize = newHeapSize;
         put(new MemoryRegion(codeBase, codeSize, MemoryState.CODE, MemoryPermission.READ_EXECUTE));
     }
 
@@ -53,8 +53,22 @@ public final class MemoryManager {
     public ControlMemoryResult controlMemory(int rawOperation, int addr0, int addr1, int size, int permission) {
         int opCode = MemoryOperation.opCode(rawOperation);
         boolean linear = MemoryOperation.isLinear(rawOperation);
-        int poolBase = linear ? linearHeapBase : newHeapBase;
-        int poolSize = linear ? linearHeapSize : newHeapSize;
+        // Achado real (investigação 2026-08-16, ver tasks/FILA-EXECUCAO.md): a flag LINEAR só
+        // decide o pool quando o chamador pede "kernel escolhe o endereço" (addr0==0) — no
+        // Horizon real, um addr0 EXPLÍCITO já identifica sozinho a região de memória (a flag é
+        // redundante nesse caso, e o crt0/libctru de fato NÃO a seta ao committar
+        // 0x08000000==GENERAL_HEAP_BASE sem LINEAR). Escolher o pool só pela flag, ignorando
+        // addr0, rejeitava com OUT_OF_RANGE um ALLOC legítimo no heap geral feito sem a flag.
+        int poolBase;
+        int poolSize;
+        if (addr0 != 0) {
+            boolean inLinearPool = fitsInPool(addr0, size, linearHeapBase, linearHeapSize);
+            poolBase = inLinearPool ? linearHeapBase : generalHeapBase;
+            poolSize = inLinearPool ? linearHeapSize : generalHeapSize;
+        } else {
+            poolBase = linear ? linearHeapBase : generalHeapBase;
+            poolSize = linear ? linearHeapSize : generalHeapSize;
+        }
 
         return switch (opCode) {
             case MemoryOperation.ALLOC -> commit(poolBase, poolSize, addr0, size,

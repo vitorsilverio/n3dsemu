@@ -28,10 +28,10 @@ class SvcTableTest {
     private static final int PAGE_SIZE = 1 << PAGE_SHIFT;
     private static final int CODE_BASE = 0x0010_0000;
     private static final int DATA_BASE = 0x0020_0000;
-    private static final int LINEAR_HEAP_BASE = 0x0800_0000;
+    private static final int GENERAL_HEAP_BASE = 0x0800_0000;
+    private static final int GENERAL_HEAP_SIZE = 2 * PAGE_SIZE;
+    private static final int LINEAR_HEAP_BASE = 0x1400_0000;
     private static final int LINEAR_HEAP_SIZE = 2 * PAGE_SIZE;
-    private static final int NEW_HEAP_BASE = 0x1400_0000;
-    private static final int NEW_HEAP_SIZE = 2 * PAGE_SIZE;
     private static final int MAIN_PROCESS_ID = 5;
     private static final int MAIN_THREAD_ID = 1;
     private static final int MAIN_THREAD_PRIORITY = 0x30;
@@ -62,7 +62,7 @@ class SvcTableTest {
         ThreadObject mainThread = ThreadObject.mainThread(MAIN_THREAD_ID, MAIN_THREAD_PRIORITY);
         HandleTable handles = new HandleTable(new ProcessObject(MAIN_PROCESS_ID), mainThread);
         MemoryManager memoryManager = new MemoryManager(CODE_BASE, PAGE_SIZE,
-                LINEAR_HEAP_BASE, LINEAR_HEAP_SIZE, NEW_HEAP_BASE, NEW_HEAP_SIZE);
+                GENERAL_HEAP_BASE, GENERAL_HEAP_SIZE, LINEAR_HEAP_BASE, LINEAR_HEAP_SIZE);
         Scheduler scheduler = new Scheduler();
         SvcTable svcTable = new SvcTable(memory, log, false, handles, memoryManager, scheduler);
         ArmCore core = new ArmCore(memory, svcTable.dispatcher(), ArmArchitecture.ARM11_MPCORE);
@@ -82,7 +82,7 @@ class SvcTableTest {
     }
 
     @Test
-    void controlMemoryAlocaNoHeapNovoEDevolveOEnderecoEmR1() {
+    void controlMemoryAlocaNoHeapGeralEDevolveOEnderecoEmR1() {
         Harness h = newHarness();
         int operation = MemoryOperation.ALLOC;
         h.core().setRegister(REGISTER_R4, MemoryPermission.READ_WRITE);
@@ -90,7 +90,7 @@ class SvcTableTest {
         CpuState result = dispatch(h, 0x01, operation, 0, 0, PAGE_SIZE);
 
         assertEquals(Result.SUCCESS.code(), result.r0());
-        assertEquals(NEW_HEAP_BASE, result.r1());
+        assertEquals(GENERAL_HEAP_BASE, result.r1());
     }
 
     @Test
@@ -233,6 +233,52 @@ class SvcTableTest {
         long low = h.memory().read32(valuesAddress) & 0xFFFF_FFFFL;
         long high = h.memory().read32(valuesAddress + 4) & 0xFFFF_FFFFL;
         assertEquals(1L, (high << 32) | low);
+    }
+
+    /// `0x39` não está na lista de SVCs da task original (achado real, sessão de continuação
+    /// 2026-08-16, ver `tasks/FILA-EXECUCAO.md`): sem ela, `__system_allocateHeaps` do libctru
+    /// computa um tamanho de heap `0` a partir do array de saída nunca escrito, e o
+    /// `svcControlMemory(MEMOP_ALLOC)` seguinte falha com `MISALIGNED_SIZE` — travando o boot do
+    /// `.3dsx` real bem antes de `main()`.
+    @Test
+    void getResourceLimitLimitValuesEscreveOTetoDeCommitNaMemoriaDoGuest() {
+        Harness h = newHarness();
+        CpuState resourceLimit = dispatch(h, 0x38, 0, HandleTable.CURRENT_PROCESS_HANDLE, 0, 0);
+        int resourceLimitHandle = resourceLimit.r1();
+
+        int namesAddress = DATA_BASE;
+        int valuesAddress = DATA_BASE + 0x100;
+        h.memory().write32(namesAddress, LimitableResource.COMMIT);
+
+        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x39);
+        CpuState state = new CpuState(valuesAddress, resourceLimitHandle, namesAddress, 1,
+                0, 0, CODE_BASE + ARM_INSTRUCTION_SIZE, 0);
+        CpuState result = h.svcTable().dispatcher().dispatch(0, state);
+
+        assertEquals(Result.SUCCESS.code(), result.r0());
+        long low = h.memory().read32(valuesAddress) & 0xFFFF_FFFFL;
+        long high = h.memory().read32(valuesAddress + 4) & 0xFFFF_FFFFL;
+        long commitLimit = (high << 32) | low;
+        // ResourceLimitValues lê os tamanhos REAIS de MemoryMap (não os pools reduzidos deste
+        // harness de teste, que só existem para caber em PAGE_SIZE pequenos) — ver Javadoc de
+        // ResourceLimitValues#limitValueOf.
+        assertEquals((long) dev.vitorsilverio.n3dsemu.memory.MemoryMap.GENERAL_HEAP_SIZE
+                + dev.vitorsilverio.n3dsemu.memory.MemoryMap.LINEAR_HEAP_SIZE, commitLimit);
+    }
+
+    @Test
+    void getResourceLimitLimitValuesComHandleInvalidaDevolveInvalidHandle() {
+        Harness h = newHarness();
+        int namesAddress = DATA_BASE;
+        h.memory().write32(namesAddress, LimitableResource.COMMIT);
+
+        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x39);
+        int bogusHandle = 0x1234;
+        CpuState state = new CpuState(DATA_BASE + 0x100, bogusHandle, namesAddress, 1,
+                0, 0, CODE_BASE + ARM_INSTRUCTION_SIZE, 0);
+        CpuState result = h.svcTable().dispatcher().dispatch(0, state);
+
+        assertEquals(Result.INVALID_HANDLE.code(), result.r0());
     }
 
     @Test

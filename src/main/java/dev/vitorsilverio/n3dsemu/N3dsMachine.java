@@ -50,11 +50,11 @@ public final class N3dsMachine {
 
     /// Ponteiro inicial de pilha da thread PRINCIPAL (placeholder — o Horizon real recebe a
     /// pilha do processo via `svcCreateProcess`/`Exheader`, fora do escopo desta HLE, RFC D1: um
-    /// processo só, sem `svcCreateProcess`). Usa o topo da região do heap "novo"
-    /// (`MemoryMap.NEW_HEAP_BASE` + `NEW_HEAP_SIZE`, 16 MiB de folga), só para o crt0 do
+    /// processo só, sem `svcCreateProcess`). Usa o topo da região do heap geral
+    /// (`MemoryMap.GENERAL_HEAP_BASE` + `GENERAL_HEAP_SIZE`, 16 MiB de folga), só para o crt0 do
     /// libctru ter uma pilha válida. Threads NOVAS (`svcCreateThread`, G2 PR2) recebem a pilha
     /// que o próprio guest aloca e passa como argumento — não usam este placeholder.
-    private static final int INITIAL_STACK_POINTER = MemoryMap.NEW_HEAP_BASE + MemoryMap.NEW_HEAP_SIZE;
+    private static final int INITIAL_STACK_POINTER = MemoryMap.GENERAL_HEAP_BASE + MemoryMap.GENERAL_HEAP_SIZE;
 
     private final ArmCore core;
     private final JitRuntime runtime;
@@ -90,8 +90,8 @@ public final class N3dsMachine {
         HandleTable handles = new HandleTable(new ProcessObject(MAIN_PROCESS_ID), mainThread);
         MemoryManager memoryManager = new MemoryManager(
                 MemoryMap.EXECUTABLE_BASE, paddedExecutableSize(image),
-                MemoryMap.LINEAR_HEAP_BASE, MemoryMap.LINEAR_HEAP_SIZE,
-                MemoryMap.NEW_HEAP_BASE, MemoryMap.NEW_HEAP_SIZE);
+                MemoryMap.GENERAL_HEAP_BASE, MemoryMap.GENERAL_HEAP_SIZE,
+                MemoryMap.LINEAR_HEAP_BASE, MemoryMap.LINEAR_HEAP_SIZE);
         Scheduler scheduler = new Scheduler();
         SvcTable svcTable = new SvcTable(memory, diagnosticLog, traceSvc, handles, memoryManager, scheduler);
         ArmCore core = new ArmCore(memory, svcTable.dispatcher(), architecture);

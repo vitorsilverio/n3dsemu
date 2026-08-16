@@ -15,19 +15,38 @@ public final class MemoryMap {
     /// dev.vitorsilverio.n3dsemu.loader.Loader3dsx#LOAD_BASE}.
     public static final int EXECUTABLE_BASE = 0x0010_0000;
 
-    /// Heap linear (`linearAlloc` do libctru) — "na prática mapeado sobre a FCRAM" no
-    /// hardware real; aqui, por simplicidade da task de esqueleto (sem MMU), tem backing
-    /// próprio. Tamanho fixado em 2 MiB (RFC §3); o alocador real (G2/G3) fica livre para
-    /// crescer isso quando `svcControlMemory`/`linearAlloc` precisarem de mais.
-    public static final int LINEAR_HEAP_BASE = 0x0800_0000;
-    public static final int LINEAR_HEAP_SIZE = 2 * 1024 * 1024;
+    /// Tamanho de cada um dos dois pools de `svcControlMemory` (heap geral e heap linear, ver
+    /// abaixo) — **os dois são iguais de propósito** (G2, achado real da sessão de investigação
+    /// 2026-08-16 — ver `tasks/FILA-EXECUCAO.md`): `__system_allocateHeaps` do libctru consulta
+    /// `svcGetResourceLimitLimitValues(COMMIT)` e reparte o teto retornado **meio a meio** entre
+    /// os dois heaps quando não há `.smdh`/exheader dizendo o contrário (caso do homebrew
+    /// `.3dsx` desta HLE) — como `ResourceLimitValues` devolve exatamente
+    /// `GENERAL_HEAP_SIZE + LINEAR_HEAP_SIZE` como teto de `COMMIT` (o máximo que esta HLE sem
+    /// MMU pode honrar de verdade, ver Javadoc daquela classe), a metade pedida só cabe nos dois
+    /// pools se os dois tiverem o MESMO tamanho. Um valor menor fazia o primeiro
+    /// `svcControlMemory(MEMOP_ALLOC)` do crt0 pedir mais do que o pool suporta e falhar com
+    /// `OUT_OF_RANGE`/`MISALIGNED_SIZE`, encerrando o guest em `svcBreak(PANIC)` antes de
+    /// `main()`.
+    private static final int HEAP_POOL_SIZE = 16 * 1024 * 1024;
 
-    /// Heap "novo" (`svcControlMemory` `MEMOP_ALLOC`) — RFC §3 não fixa um tamanho ("—");
-    /// 16 MiB é um placeholder razoável para o esqueleto (G1 não implementa
-    /// `svcControlMemory` de verdade — isso é G2), documentado para não ser confundido com
-    /// um valor hardware-preciso.
-    public static final int NEW_HEAP_BASE = 0x1400_0000;
-    public static final int NEW_HEAP_SIZE = 16 * 1024 * 1024;
+    /// Heap "geral" (`svcControlMemory` `MEMOP_ALLOC` **sem** a flag `LINEAR`) — 3dbrew:
+    /// Memory_layout, "Heap mapped by ControlMemory", base `0x08000000` no Old3DS. **Achado real
+    /// (G2, sessão de investigação 2026-08-16, ver `tasks/FILA-EXECUCAO.md`): esta base e a de
+    /// {@link #LINEAR_HEAP_BASE} estavam TROCADAS** — o nome "heap linear" tinha sido colado no
+    /// endereço errado (`0x08000000`, que na verdade é o heap GERAL/não-linear real), e
+    /// `MemoryManager#controlMemory` roteava `MEMOP_ALLOC_LINEAR` para o pool errado como
+    /// consequência direta. Confirmado contra a tabela de `Memory_layout` do 3dbrew antes de
+    /// corrigir, não um palpite.
+    public static final int GENERAL_HEAP_BASE = 0x0800_0000;
+    public static final int GENERAL_HEAP_SIZE = HEAP_POOL_SIZE;
+
+    /// Heap linear (`linearAlloc` do libctru, `svcControlMemory` `MEMOP_ALLOC_LINEAR`) —
+    /// "mapeado sobre a FCRAM para acesso fisicamente contíguo" no hardware real (3dbrew:
+    /// Memory_layout, mapeamento LINEAR, base `0x14000000` no Old3DS); aqui, por simplicidade da
+    /// task de esqueleto (sem MMU), tem backing próprio. Ver Javadoc de {@link #GENERAL_HEAP_BASE}
+    /// para o achado de troca de endereços corrigido nesta sessão.
+    public static final int LINEAR_HEAP_BASE = 0x1400_0000;
+    public static final int LINEAR_HEAP_SIZE = HEAP_POOL_SIZE;
 
     /// VRAM: 2 bancos de 3 MiB (RFC §3/D6).
     public static final int VRAM_BASE = 0x1800_0000;

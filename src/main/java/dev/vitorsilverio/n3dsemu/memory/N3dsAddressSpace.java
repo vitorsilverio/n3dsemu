@@ -20,8 +20,8 @@ public final class N3dsAddressSpace {
         PagedAddressSpace memory = new PagedAddressSpace(MemoryMap.PAGE_SHIFT, new LoggingOpenBus(diagnosticLog));
 
         memory.mapRam(MemoryMap.EXECUTABLE_BASE, buildExecutableImage(image));
+        memory.mapRam(MemoryMap.GENERAL_HEAP_BASE, new byte[MemoryMap.GENERAL_HEAP_SIZE]);
         memory.mapRam(MemoryMap.LINEAR_HEAP_BASE, new byte[MemoryMap.LINEAR_HEAP_SIZE]);
-        memory.mapRam(MemoryMap.NEW_HEAP_BASE, new byte[MemoryMap.NEW_HEAP_SIZE]);
         memory.mapRam(MemoryMap.VRAM_BASE, new byte[MemoryMap.VRAM_SIZE]);
         memory.mapRam(MemoryMap.DSP_RAM_BASE, new byte[MemoryMap.DSP_RAM_SIZE]);
         memory.mapHandler(MemoryMap.CONFIG_MEMORY_BASE, MemoryMap.CONFIG_MEMORY_SIZE, ConfigMemory.create());
