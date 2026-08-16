@@ -18,10 +18,17 @@ import java.util.Optional;
 /// passa por {@link #resolve}, que devolve `Optional.empty()`.
 public final class HandleTable {
     /// 3dbrew: Handle — pseudo-handle que qualquer SVC que aceite `Handle` resolve para o
-    /// processo do chamador, sem entrada na tabela real.
-    public static final int CURRENT_PROCESS_HANDLE = 0xFFFF8000;
-    /// 3dbrew: Handle — idem, para a thread do chamador.
-    public static final int CURRENT_THREAD_HANDLE = 0xFFFF8001;
+    /// processo do chamador, sem entrada na tabela real. **Valor corrigido nesta sessão**: o
+    /// header real do libctru (`3ds/svc.h`, `CUR_PROCESS_HANDLE`) e o `.3dsx` de teste
+    /// (`__system_allocateHeaps` passando `0xFFFF8001` para `svcGetResourceLimit`) confirmam
+    /// que `0xFFFF8001` é o processo — o valor anterior aqui (`0xFFFF8000`) estava trocado com
+    /// {@link #CURRENT_THREAD_HANDLE}, o que fazia `svcGetResourceLimit(CUR_PROCESS_HANDLE)`
+    /// resolver para a thread atual (não um `ProcessObject`) e devolver
+    /// {@link Result#INVALID_HANDLE}, levando o guest a chamar `svcBreak(PANIC)` logo após o
+    /// desbloqueio do FPSCR pela B3.8 do arm-jitter.
+    public static final int CURRENT_PROCESS_HANDLE = 0xFFFF8001;
+    /// 3dbrew: Handle — idem, para a thread do chamador (`CUR_THREAD_HANDLE` em `3ds/svc.h`).
+    public static final int CURRENT_THREAD_HANDLE = 0xFFFF8000;
 
     /// Primeira handle alocável de verdade. `0` é reservado (nunca devolvido por
     /// {@link #create}), espelhando o Horizon real onde a handle `0` nunca é um objeto válido.
