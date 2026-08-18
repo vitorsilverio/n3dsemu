@@ -91,4 +91,44 @@ class GspGpuServiceTest {
         KernelObject resolved = h.handles().resolve(memHandle).orElseThrow();
         assertInstanceOf(MemoryBlockObject.class, resolved);
     }
+
+    /// Regressão do achado real da G3.3: {@code pushInterrupt} escrevia a entrada nova no índice
+    /// do CURSOR DE LEITURA (offset 0x0 da fila) e avançava esse mesmo campo — mas esse campo
+    /// pertence ao CLIENTE (`popInterrupt()` do libctru real o lê como `cur` e o avança sozinho a
+    /// cada entrada consumida). A posição de escrita correta é `(readCursor + count) % CAPACITY`
+    /// (3dbrew: "Offset from the count where to save incoming interrupts") — o kernel nunca deve
+    /// tocar no cursor de leitura. Sem o fix, a primeira interrupção real (`PDC0`/VBlankTop`=2`)
+    /// era escrita no slot 0 mas o avanço do cursor fazia o cliente ler o slot 1 (ainda zerado =
+    /// `PSC0`=`0`) — o guest sinalizava o `LightEvent` errado (`gspEvents[0]` em vez de
+    /// `gspEvents[2]`) e `gspWaitForEvent(GSPGPU_EVENT_VBlank0, ...)`, chamado por `gfxInit` logo
+    /// no arranque do `read-controls.3dsx`, nunca era satisfeito — a thread principal travava para
+    /// sempre em `svcArbitrateAddress(WAIT_IF_LESS_THAN)`, confirmado nesta sessão via trace com
+    /// captura de `LR` (localizou o chamador real em `gfxInit`, não o wrapper fino do `svc`) e
+    /// desmontagem de `read-controls.elf` (`arm-none-eabi-objdump`) cruzada com o `popInterrupt()`
+    /// real do libctru (`WebFetch`).
+    @Test
+    void pushInterruptEscreveNoIndiceDerivadoDeContagemENaoMexeNoCursorDeLeitura() {
+        Harness h = newHarness();
+        int eventHandle = h.handles().create(new EventObject(ResetType.STICKY));
+        invokeRegister(h, eventHandle);
+        int memHandle = h.memory().read32(BUFFER_ADDRESS + 4 * 4);
+        MemoryBlockObject block = (MemoryBlockObject) h.handles().resolve(memHandle).orElseThrow();
+        block.bindHostBacking(SHARED_MEMORY_ADDRESS);
+
+        h.gsp().onVBlank();
+        h.gsp().onVBlank();
+
+        int readCursorOffset = 0x0;
+        int countOffset = 0x1;
+        int entriesOffset = 0xC;
+        int pdc0VBlankTop = 2;
+        // O escritor NUNCA deve mexer no cursor de leitura (pertence só ao cliente) — só a
+        // contagem avança.
+        assertEquals(0, h.memory().read8(SHARED_MEMORY_ADDRESS + readCursorOffset) & 0xFF);
+        assertEquals(2, h.memory().read8(SHARED_MEMORY_ADDRESS + countOffset) & 0xFF);
+        // As duas entradas caem em slots DIFERENTES e corretos: (readCursor=0+count) a cada
+        // chamada, não ambas no slot 0 nem no slot do cursor de leitura avançado incorretamente.
+        assertEquals(pdc0VBlankTop, h.memory().read8(SHARED_MEMORY_ADDRESS + entriesOffset) & 0xFF);
+        assertEquals(pdc0VBlankTop, h.memory().read8(SHARED_MEMORY_ADDRESS + entriesOffset + 1) & 0xFF);
+    }
 }

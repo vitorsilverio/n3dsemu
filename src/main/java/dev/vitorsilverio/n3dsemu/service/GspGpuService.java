@@ -81,7 +81,13 @@ public final class GspGpuService extends AbstractService {
     // ── fila de interrupções da memória compartilhada (3dbrew: GSP Shared Memory) ──────────
     // Bloco de 0x40 bytes por cliente; só um cliente nesta HLE (RFC D1), sempre no offset 0 do
     // bloco. Ver Javadoc da classe ("Achado real G3") para o porquê disto ser necessário.
-    private static final int INTERRUPT_QUEUE_WRITE_INDEX_OFFSET = 0x0;
+    /// 3dbrew ("GSP Shared Memory"): "Offset from the count where to save incoming interrupts" —
+    /// **não** é um write-cursor próprio do kernel: é o cursor de LEITURA do cliente
+    /// (`gspEventThreadMain`/`popInterrupt` do libctru real leem este mesmo byte como `cur` e o
+    /// avançam a cada entrada consumida). A posição de escrita correta é DERIVADA como
+    /// `(readCursor + count) % CAPACITY` (achado real da G3.3, confirmado contra o texto da wiki
+    /// e contra `popInterrupt()` do libctru via `WebFetch`) — o kernel NUNCA escreve neste campo.
+    private static final int INTERRUPT_QUEUE_READ_CURSOR_OFFSET = 0x0;
     private static final int INTERRUPT_QUEUE_COUNT_OFFSET = 0x1;
     private static final int INTERRUPT_QUEUE_ENTRIES_OFFSET = 0xC;
     private static final int INTERRUPT_QUEUE_CAPACITY = 0x40 - INTERRUPT_QUEUE_ENTRIES_OFFSET;
@@ -160,7 +166,7 @@ public final class GspGpuService extends AbstractService {
     /// fila de interrupções ANTES de sinalizar {@link #interruptEvent} (achado real, ver Javadoc
     /// da classe) — sem isso a thread interna do libctru que espera este evento nunca repassa o
     /// sinal para quem `gspWaitForVBlank()` de verdade espera.
-    private void onVBlank() {
+    void onVBlank() {
         Object resolvedBlock = handles.resolve(gspSharedMemoryHandle).orElse(null);
         if (resolvedBlock instanceof MemoryBlockObject block && block.hostMapped()) {
             pushInterrupt(block.address(), INTERRUPT_TYPE_PDC0_VBLANK_TOP);
@@ -171,15 +177,26 @@ public final class GspGpuService extends AbstractService {
         hidService.advanceFrame();
     }
 
-    /// Escreve uma entrada na fila circular de interrupções (3dbrew: GSP Shared Memory) e
-    /// avança índice/contagem — satura em {@link #INTERRUPT_QUEUE_CAPACITY} (o hardware real
-    /// descarta e conta em "missed", este HLE só satura, suficiente para nunca perder o VBlank
-    /// mais recente).
+    /// Escreve uma entrada na fila circular de interrupções (3dbrew: GSP Shared Memory) e avança
+    /// a contagem — satura em {@link #INTERRUPT_QUEUE_CAPACITY} (o hardware real descarta e conta
+    /// em "missed", este HLE só satura, suficiente para nunca perder o VBlank mais recente).
+    ///
+    /// **Achado real (G3.3)**: a posição de escrita é `(readCursor + count) % CAPACITY`, nunca o
+    /// {@link #INTERRUPT_QUEUE_READ_CURSOR_OFFSET} diretamente — esse campo pertence ao cliente
+    /// (`popInterrupt()` do libctru real o lê/avança a cada entrada consumida). A versão anterior
+    /// escrevia no índice `readCursor` e avançava esse MESMO campo, colidindo com o cursor do
+    /// cliente: a primeira entrada real (`PDC0`/VBlankTop`=2`) acabava sendo escrita no slot 0 mas
+    /// lida do slot 1 (ainda zerado = `PSC0`=`0`), então o cliente sinalizava `gspEvents[0]` em vez
+    /// de `gspEvents[2]` — `gspWaitForEvent(GSPGPU_EVENT_VBlank0, ...)`, chamado por `gfxInit` logo
+    /// no arranque do `read-controls.3dsx`, nunca era satisfeito e a thread principal travava para
+    /// sempre em `svcArbitrateAddress(WAIT_IF_LESS_THAN)` — a causa raiz do bloqueio investigado
+    /// pela G3.3 (a G3.2, sessão anterior, já tinha corrigido um bug de índice DIFERENTE, o
+    /// `GSP_MODULE_THREAD_INDEX`, que destravou a thread de relay em si, mas não este).
     private void pushInterrupt(int base, int interruptType) {
-        int writeIndex = memory.read8(base + INTERRUPT_QUEUE_WRITE_INDEX_OFFSET) & U8_MASK;
+        int readCursor = memory.read8(base + INTERRUPT_QUEUE_READ_CURSOR_OFFSET) & U8_MASK;
         int count = memory.read8(base + INTERRUPT_QUEUE_COUNT_OFFSET) & U8_MASK;
+        int writeIndex = (readCursor + count) % INTERRUPT_QUEUE_CAPACITY;
         memory.write8(base + INTERRUPT_QUEUE_ENTRIES_OFFSET + writeIndex, interruptType);
-        memory.write8(base + INTERRUPT_QUEUE_WRITE_INDEX_OFFSET, (writeIndex + 1) % INTERRUPT_QUEUE_CAPACITY);
         memory.write8(base + INTERRUPT_QUEUE_COUNT_OFFSET, Math.min(count + 1, INTERRUPT_QUEUE_CAPACITY));
     }
 
