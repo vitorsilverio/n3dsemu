@@ -64,10 +64,19 @@ public final class GspGpuService extends AbstractService {
     static final long TICKS_PER_FRAME = ARM11_CLOCK_HZ / VBLANK_HZ;
 
     private static final int GSP_SHARED_MEMORY_SIZE = MemoryMap.PAGE_SIZE;
-    /// `u8` — 1 na primeira `RegisterInterruptRelayQueue` (3dbrew/citra: `first_initialization`,
-    /// diz ao guest se é o primeiro processo a registrar; esta HLE só sustenta uma thread/
-    /// processo, RFC D1, então é sempre `1`).
-    private static final int FIRST_INITIALIZATION_FLAG = 1;
+    /// `u8` — segundo parâmetro normal de saída de `RegisterInterruptRelayQueue` (3dbrew:
+    /// "GSP module thread index", **não** um booleano de "primeira inicialização" como o nome
+    /// antigo desta constante sugeria — achado real da G3.2). O guest usa este valor como
+    /// ÍNDICE DE CLIENTE para calcular a base do próprio bloco de 0x40 bytes na fila de
+    /// interrupções (`clientBlock = sharedMemBase + threadIndex*0x40`, ver
+    /// `gspEventThreadMain` do libctru real via `arm-none-eabi-objdump`) — devolver `1` fazia o
+    /// guest ler/escrever no bloco do CLIENTE 1 (offset `0x40`), enquanto {@link #pushInterrupt}
+    /// sempre escreve no bloco do CLIENTE 0 (offset `0`, esta HLE só sustenta um cliente, RFC
+    /// D1): o guest nunca via as interrupções que este serviço empurrava, sua thread de relay
+    /// ficava girando `svcClearEvent`/`svcWaitSynchronization` para sempre sem processar nada e
+    /// nunca cedia a CPU para a thread principal da aplicação. `0` é o índice correto do único
+    /// cliente que esta HLE sustenta.
+    private static final int GSP_MODULE_THREAD_INDEX = 0;
 
     // ── fila de interrupções da memória compartilhada (3dbrew: GSP Shared Memory) ──────────
     // Bloco de 0x40 bytes por cliente; só um cliente nesta HLE (RFC D1), sempre no offset 0 do
@@ -133,7 +142,7 @@ public final class GspGpuService extends AbstractService {
         }
         response.header(request.commandId(), 2, 2);
         response.result(Result.SUCCESS);
-        response.normalParam(1, FIRST_INITIALIZATION_FLAG);
+        response.normalParam(1, GSP_MODULE_THREAD_INDEX);
         response.translateHandles(gspSharedMemoryHandle);
     }
 
