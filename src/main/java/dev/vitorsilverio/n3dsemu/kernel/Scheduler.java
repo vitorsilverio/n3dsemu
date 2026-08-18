@@ -63,6 +63,15 @@ public final class Scheduler {
     private N3dsCp15 cp15;
     private ThreadObject current;
 
+    /// Pulsos periódicos do host (G3 — VBlank do `gsp::Gpu`/atualização do `hid:USER`, 60&nbsp;Hz
+    /// sobre o relógio de ticks). Ver Javadoc de {@link #registerPeriodicPulse}.
+    private final List<PeriodicPulse> pulses = new ArrayList<>();
+    /// Limite defensivo de iterações de fast-forward por chamada de {@link #pickNextAndSwitch}
+    /// — cada pulso due sempre reagenda para um tick estritamente maior (período > 0), então
+    /// isto nunca deveria disparar; existe só para transformar um bug de reagendamento futuro
+    /// num erro claro em vez de uma trava silenciosa da JVM.
+    private static final int MAX_FAST_FORWARD_ITERATIONS = 100_000;
+
     /// Liga o escalonador ao {@link ArmCore}/{@link N3dsCp15} reais (dependência circular do
     /// construtor — mesmo padrão de `SvcTable#attach`) e registra `mainThread` (já construída
     /// via {@link ThreadObject#mainThread}, com TLS fixo em {@link MemoryMap#TLS_BASE}) como a
@@ -172,16 +181,78 @@ public final class Scheduler {
         }
     }
 
+    // ── pulsos periódicos (G3: VBlank/HID a 60 Hz) ──────────────────────────────────────────
+
+    /// Um pulso periódico do host: dispara `onFire` sempre que o relógio virtual alcança
+    /// `nextFireTick`, e reagenda para `periodTicks` ciclos depois (nunca perde um "quadro":
+    /// se o relógio pulou vários períodos de uma vez — por causa do fast-forward de
+    /// {@link #pickNextAndSwitch} —, {@link #fireIfDue} dispara uma vez só e reagenda a partir
+    /// de ONDE ESTAVA, não do relógio atual, para não acumular atraso silenciosamente nem
+    /// disparar em rajada).
+    private static final class PeriodicPulse {
+        private final long periodTicks;
+        private final Runnable onFire;
+        /// `-1` = ainda não inicializado (`registerPeriodicPulse` pode acontecer ANTES de
+        /// {@link Scheduler#attach}, quando {@link Scheduler#currentTick()} não é chamável
+        /// ainda — ver Javadoc de {@link #registerPeriodicPulse}).
+        private long nextFireTick = -1;
+
+        private PeriodicPulse(long periodTicks, Runnable onFire) {
+            this.periodTicks = periodTicks;
+            this.onFire = onFire;
+        }
+
+        private void ensureInitialized(long now) {
+            if (nextFireTick < 0) {
+                nextFireTick = now + periodTicks;
+            }
+        }
+
+        private boolean fireIfDue(long now) {
+            ensureInitialized(now);
+            if (now < nextFireTick) {
+                return false;
+            }
+            onFire.run();
+            nextFireTick += periodTicks;
+            return true;
+        }
+
+        private long nextFireTick(long now) {
+            ensureInitialized(now);
+            return nextFireTick;
+        }
+    }
+
+    /// Registra um pulso periódico (RFC-N3DSEMU G3): `onFire` roda sempre que o relógio virtual
+    /// avança `periodTicks` ciclos além do disparo anterior. Chamável ANTES de {@link #attach}
+    /// (os serviços `gsp::Gpu`/`hid:USER` são construídos antes do {@link ArmCore} existir,
+    /// mesma dependência circular já documentada em outros pontos desta classe) — o primeiro
+    /// disparo só é calculado na primeira vez que o pulso é avaliado de verdade, dentro de
+    /// {@link #pickNextAndSwitch}.
+    public void registerPeriodicPulse(long periodTicks, Runnable onFire) {
+        if (periodTicks <= 0) {
+            throw new IllegalArgumentException("periodTicks deve ser positivo: " + periodTicks);
+        }
+        pulses.add(new PeriodicPulse(periodTicks, Objects.requireNonNull(onFire, "onFire")));
+    }
+
     // ── decisão de escalonamento ────────────────────────────────────────────────────────────
 
     /// Reavalia toda thread bloqueada (chamado antes de escolher a próxima a rodar): acorda
-    /// quem já pode (condição satisfeita ou timeout vencido). Também chamado depois de
-    /// qualquer operação que possa ter mudado o estado de um {@link Waitable} (liberar mutex/
-    /// semáforo, sinalizar evento) — a liberação em si NÃO cede a CPU (mesma semântica do
-    /// Horizon real: quem libera continua rodando), só marca os esperadores como
-    /// {@link ThreadObject.State#READY} para a PRÓXIMA troca de contexto os escolher.
+    /// quem já pode (condição satisfeita ou timeout vencido) e dispara qualquer pulso periódico
+    /// já devido (ver {@link #registerPeriodicPulse}) — nesta ordem, para que um pulso que
+    /// sinaliza um evento (`gsp::Gpu` VBlank) já acorde quem espera nele na MESMA avaliação, sem
+    /// esperar a próxima chamada. Também chamado depois de qualquer operação que possa ter
+    /// mudado o estado de um {@link Waitable} (liberar mutex/semáforo, sinalizar evento) — a
+    /// liberação em si NÃO cede a CPU (mesma semântica do Horizon real: quem libera continua
+    /// rodando), só marca os esperadores como {@link ThreadObject.State#READY} para a PRÓXIMA
+    /// troca de contexto os escolher.
     private void reevaluateBlockedThreads() {
         long now = currentTick();
+        for (PeriodicPulse pulse : pulses) {
+            pulse.fireIfDue(now);
+        }
         for (ThreadObject t : threads) {
             switch (t.state()) {
                 case SLEEPING -> {
@@ -240,8 +311,13 @@ public final class Scheduler {
         return best;
     }
 
-    private long earliestTimeoutTick() {
+    /// Menor tick futuro que pode desbloquear ALGUMA coisa: timeout de thread OU próximo disparo
+    /// de um pulso periódico (G3) — sem os pulsos aqui, um guest que só espera VBlank/HID (sem
+    /// timeout próprio, espera infinita) nunca teria como onde adiantar o relógio virtual, e
+    /// {@link #pickNextAndSwitch} declararia deadlock incorretamente.
+    private long earliestWakeTick() {
         long min = Long.MAX_VALUE;
+        long now = currentTick();
         for (ThreadObject t : threads) {
             boolean waitingWithTimeout = (t.state() == ThreadObject.State.SLEEPING
                     || t.state() == ThreadObject.State.WAITING_SYNC
@@ -249,6 +325,9 @@ public final class Scheduler {
             if (waitingWithTimeout) {
                 min = Math.min(min, t.wakeTick());
             }
+        }
+        for (PeriodicPulse pulse : pulses) {
+            min = Math.min(min, pulse.nextFireTick(now));
         }
         return min;
     }
@@ -264,11 +343,17 @@ public final class Scheduler {
     private void pickNextAndSwitch() {
         reevaluateBlockedThreads();
         ThreadObject next = selectReadyThread();
-        if (next == null) {
-            long fastForwardTo = earliestTimeoutTick();
+        int iterations = 0;
+        while (next == null) {
+            if (iterations++ >= MAX_FAST_FORWARD_ITERATIONS) {
+                throw new IllegalStateException(
+                        "kernel HLE: fast-forward excedeu " + MAX_FAST_FORWARD_ITERATIONS
+                                + " iterações sem liberar nenhuma thread (ver Javadoc de MAX_FAST_FORWARD_ITERATIONS)");
+            }
+            long fastForwardTo = earliestWakeTick();
             if (fastForwardTo == Long.MAX_VALUE) {
                 throw new IllegalStateException(
-                        "kernel HLE: nenhuma thread pronta e nenhum timeout pendente (deadlock cooperativo — "
+                        "kernel HLE: nenhuma thread pronta e nenhum timeout/pulso pendente (deadlock cooperativo — "
                                 + "ver Javadoc de Scheduler#pickNextAndSwitch)");
             }
             long delta = fastForwardTo - currentTick();

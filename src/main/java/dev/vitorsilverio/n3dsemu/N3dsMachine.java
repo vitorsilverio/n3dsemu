@@ -9,6 +9,8 @@ import dev.vitorsilverio.armjitter.jit.JitRuntime;
 import dev.vitorsilverio.armjitter.jit.JitRuntimeFactory;
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.n3dsemu.core.N3dsCp15;
+import dev.vitorsilverio.n3dsemu.input.InputScript;
+import dev.vitorsilverio.n3dsemu.input.InputState;
 import dev.vitorsilverio.n3dsemu.kernel.HandleTable;
 import dev.vitorsilverio.n3dsemu.kernel.MemoryManager;
 import dev.vitorsilverio.n3dsemu.kernel.ProcessObject;
@@ -18,6 +20,14 @@ import dev.vitorsilverio.n3dsemu.kernel.ThreadObject;
 import dev.vitorsilverio.n3dsemu.loader.Image3dsx;
 import dev.vitorsilverio.n3dsemu.memory.MemoryMap;
 import dev.vitorsilverio.n3dsemu.memory.N3dsAddressSpace;
+import dev.vitorsilverio.n3dsemu.service.AptService;
+import dev.vitorsilverio.n3dsemu.service.CfgUService;
+import dev.vitorsilverio.n3dsemu.service.FsUserService;
+import dev.vitorsilverio.n3dsemu.service.GspGpuService;
+import dev.vitorsilverio.n3dsemu.service.HidService;
+import dev.vitorsilverio.n3dsemu.service.PtmUService;
+import dev.vitorsilverio.n3dsemu.service.ServiceRegistry;
+import dev.vitorsilverio.n3dsemu.service.SrvService;
 
 import java.io.PrintStream;
 
@@ -59,21 +69,32 @@ public final class N3dsMachine {
     private final ArmCore core;
     private final JitRuntime runtime;
     private final SvcTable svcTable;
+    private final InputState inputState;
 
-    private N3dsMachine(ArmCore core, JitRuntime runtime, SvcTable svcTable) {
+    private N3dsMachine(ArmCore core, JitRuntime runtime, SvcTable svcTable, InputState inputState) {
         this.core = core;
         this.runtime = runtime;
         this.svcTable = svcTable;
+        this.inputState = inputState;
     }
 
     /// Monta a máquina completa e posiciona o core no `entryPoint` de `image`, pronta para
-    /// {@link #runSlice()}.
+    /// {@link #runSlice()}. Sem `--script` (ver a sobrecarga abaixo) — só injeção de input via
+    /// {@link #pressButtons}/{@link #releaseButtons}/{@link #setTouch}/{@link #setCirclePad}.
     ///
     /// @param image           executável `.3dsx` já carregado/relocado
     /// @param backend         backend de execução do core
     /// @param diagnosticLog   destino do log de barramento aberto e do trace de SVC
     /// @param traceSvc        se `true`, cada `svc` interceptada é impressa em `diagnosticLog`
     public static N3dsMachine create(Image3dsx image, Backend backend, PrintStream diagnosticLog, boolean traceSvc) {
+        return create(image, backend, diagnosticLog, traceSvc, null);
+    }
+
+    /// Como {@link #create(Image3dsx, Backend, PrintStream, boolean)}, mas com um
+    /// {@link InputScript} opcional (RFC-N3DSEMU G3 — `--script=<arquivo>`) aplicado a cada
+    /// VBlank simulado por {@link HidService#advanceFrame}.
+    public static N3dsMachine create(Image3dsx image, Backend backend, PrintStream diagnosticLog, boolean traceSvc,
+                                      InputScript inputScript) {
         PagedAddressSpace memory = N3dsAddressSpace.create(image, diagnosticLog);
 
         // B5.2: ARMv6K + VFPv2, sem Thumb-2 (o MPCore do 3DS é ARMv6K, não ARMv6T2).
@@ -93,7 +114,24 @@ public final class N3dsMachine {
                 MemoryMap.GENERAL_HEAP_BASE, MemoryMap.GENERAL_HEAP_SIZE,
                 MemoryMap.LINEAR_HEAP_BASE, MemoryMap.LINEAR_HEAP_SIZE);
         Scheduler scheduler = new Scheduler();
-        SvcTable svcTable = new SvcTable(memory, diagnosticLog, traceSvc, handles, memoryManager, scheduler);
+
+        // RFC-N3DSEMU G3: registro de serviços + IPC. gsp::Gpu registra o pulso de VBlank do
+        // sistema no Scheduler (ver Javadoc de GspGpuService) — pode acontecer aqui, ANTES de
+        // scheduler.attach, porque registerPeriodicPulse não exige core anexado ainda (mesma
+        // dependência circular já documentada nesta classe para SvcTable/attach).
+        InputState inputState = new InputState();
+        ServiceRegistry serviceRegistry = new ServiceRegistry();
+        HidService hidService = new HidService(diagnosticLog, memory, handles, inputState, inputScript);
+        GspGpuService gspGpuService = new GspGpuService(diagnosticLog, memory, handles, scheduler, hidService);
+        serviceRegistry.register(new SrvService(diagnosticLog, handles, serviceRegistry));
+        serviceRegistry.register(new AptService(diagnosticLog, handles));
+        serviceRegistry.register(hidService);
+        serviceRegistry.register(new FsUserService(diagnosticLog));
+        serviceRegistry.register(gspGpuService);
+        serviceRegistry.register(new CfgUService(diagnosticLog, memory));
+        serviceRegistry.register(new PtmUService(diagnosticLog));
+
+        SvcTable svcTable = new SvcTable(memory, diagnosticLog, traceSvc, handles, memoryManager, scheduler, serviceRegistry);
         ArmCore core = new ArmCore(memory, svcTable.dispatcher(), architecture);
         svcTable.attach(core);
         // RFC D1: monitor de exclusividade COMPARTILHADO instalado desde já, mesmo com um só
@@ -109,7 +147,27 @@ public final class N3dsMachine {
         // Scheduler, nunca por manipulação direta do ArmCore.
         scheduler.attach(core, cp15, mainThread);
 
-        return new N3dsMachine(core, runtime, svcTable);
+        return new N3dsMachine(core, runtime, svcTable, inputState);
+    }
+
+    // ── injeção de input sem GUI (RFC-N3DSEMU G3) ───────────────────────────────────────────
+
+    /// Marca os botões em `mask` (convenção `KEY_*`, ver
+    /// {@link dev.vitorsilverio.n3dsemu.input.Keys}) como pressionados, até {@link #releaseButtons}.
+    public void pressButtons(int mask) {
+        inputState.pressButtons(mask);
+    }
+
+    public void releaseButtons(int mask) {
+        inputState.releaseButtons(mask);
+    }
+
+    public void setTouch(int x, int y) {
+        inputState.setTouch(x, y);
+    }
+
+    public void setCirclePad(int dx, int dy) {
+        inputState.setCirclePad(dx, dy);
     }
 
     /// Executa uma fatia do laço principal ({@link #RUN_SLICE_BLOCKS} blocos). Propaga
@@ -132,11 +190,11 @@ public final class N3dsMachine {
     }
 
     // Mesmo arredondamento de N3dsAddressSpace#buildExecutableImage (PagedAddressSpace exige
-    // backing múltiplo de pageSize) — repetido aqui porque o MemoryManager (contabilidade de
-    // svcControlMemory/svcQueryMemory) precisa saber o tamanho da região CODE já registrada no
-    // barramento, sem acoplar as duas classes por um método package-private cruzado.
+    // backing múltiplo de pageSize) — usa N3dsAddressSpace#executableRegionSize (G3: já conta o
+    // espaçamento entre segmentos, ver Javadoc daquele método) em vez de image.totalSize(), que
+    // conta só a soma bruta dos 3 tamanhos do arquivo (sem o padding entre segmentos).
     private static int paddedExecutableSize(Image3dsx image) {
-        int rawSize = image.totalSize();
+        int rawSize = N3dsAddressSpace.executableRegionSize(image);
         return (rawSize + MemoryMap.PAGE_SIZE - 1) & ~(MemoryMap.PAGE_SIZE - 1);
     }
 }

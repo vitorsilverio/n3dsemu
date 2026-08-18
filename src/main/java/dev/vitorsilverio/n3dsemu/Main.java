@@ -1,5 +1,6 @@
 package dev.vitorsilverio.n3dsemu;
 
+import dev.vitorsilverio.n3dsemu.input.InputScript;
 import dev.vitorsilverio.n3dsemu.kernel.KernelHaltException;
 import dev.vitorsilverio.n3dsemu.kernel.SvcCall;
 import dev.vitorsilverio.n3dsemu.kernel.UnsupportedSvcException;
@@ -47,11 +48,14 @@ public final class Main {
         N3dsMachine.Backend backend = N3dsMachine.Backend.JIT;
         int sliceCount = DEFAULT_SLICE_COUNT;
         boolean traceSvc = false;
+        InputScript inputScript = null;
         int index = 0;
         while (index < args.length && args[index].startsWith("--")) {
             String arg = args[index];
             if (arg.startsWith("--slices=")) {
                 sliceCount = Integer.parseInt(arg.substring("--slices=".length()));
+            } else if (arg.startsWith("--script=")) {
+                inputScript = InputScript.load(Path.of(arg.substring("--script=".length())));
             } else {
                 switch (arg) {
                     case "--interp" -> backend = N3dsMachine.Backend.INTERPRETED;
@@ -80,7 +84,7 @@ public final class Main {
             return;
         }
 
-        N3dsMachine machine = N3dsMachine.create(image, backend, System.out, traceSvc);
+        N3dsMachine machine = N3dsMachine.create(image, backend, System.out, traceSvc, inputScript);
         for (int i = 0; i < sliceCount; i++) {
             try {
                 machine.runSlice();
@@ -129,7 +133,7 @@ public final class Main {
     }
 
     private static void usage() {
-        System.err.println("uso: n3dsemu [--interp|--check] [--slices=N] [--trace-svc] <arquivo.3dsx>");
+        System.err.println("uso: n3dsemu [--interp|--check] [--slices=N] [--trace-svc] [--script=<arquivo>] <arquivo.3dsx>");
         System.exit(EXIT_USAGE_ERROR);
     }
 }

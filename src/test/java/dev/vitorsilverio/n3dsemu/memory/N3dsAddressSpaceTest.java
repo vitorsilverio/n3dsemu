@@ -2,6 +2,7 @@ package dev.vitorsilverio.n3dsemu.memory;
 
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.n3dsemu.loader.Image3dsx;
+import dev.vitorsilverio.n3dsemu.loader.Loader3dsx;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -20,12 +21,18 @@ class N3dsAddressSpaceTest {
         return new Image3dsx(MemoryMap.EXECUTABLE_BASE, MemoryMap.EXECUTABLE_BASE, code, rodata, dataWithBss);
     }
 
+    /// **G3, achado real (ver Javadoc de {@link Loader3dsx}):** rodata/data NÃO ficam logo
+    /// depois do código pelo tamanho bruto — cada segmento é arredondado para cima até
+    /// {@link Loader3dsx#SEGMENT_ALIGNMENT} antes do próximo começar (mesmo espaçamento que os
+    /// ponteiros relocados de um `.3dsx` real assumem).
     @Test
     void carregaExecutavelEmExecutableBase() {
         PagedAddressSpace memory = N3dsAddressSpace.create(tinyImage(), System.out);
+        int rodataBase = MemoryMap.EXECUTABLE_BASE + Loader3dsx.segmentOffset(4);
+        int dataBase = rodataBase + Loader3dsx.segmentOffset(4);
         assertEquals(0x44332211, memory.read32(MemoryMap.EXECUTABLE_BASE));
-        assertEquals(0x88776655, memory.read32(MemoryMap.EXECUTABLE_BASE + 4));
-        assertEquals(0x0000AA99, memory.read32(MemoryMap.EXECUTABLE_BASE + 8));
+        assertEquals(0x88776655, memory.read32(rodataBase));
+        assertEquals(0x0000AA99, memory.read32(dataBase));
     }
 
     @Test

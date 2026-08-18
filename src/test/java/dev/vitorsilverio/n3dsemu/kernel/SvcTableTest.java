@@ -6,6 +6,7 @@ import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.armjitter.swi.CpuState;
 import dev.vitorsilverio.n3dsemu.core.N3dsCp15;
 import dev.vitorsilverio.n3dsemu.memory.LoggingOpenBus;
+import dev.vitorsilverio.n3dsemu.service.ServiceRegistry;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -47,7 +48,7 @@ class SvcTableTest {
 
     private record Harness(PagedAddressSpace memory, ArmCore core, SvcTable svcTable,
                             HandleTable handles, Scheduler scheduler, ThreadObject mainThread,
-                            ByteArrayOutputStream stdout) {
+                            ByteArrayOutputStream stdout, ServiceRegistry serviceRegistry) {
     }
 
     private Harness newHarness() {
@@ -64,13 +65,14 @@ class SvcTableTest {
         MemoryManager memoryManager = new MemoryManager(CODE_BASE, PAGE_SIZE,
                 GENERAL_HEAP_BASE, GENERAL_HEAP_SIZE, LINEAR_HEAP_BASE, LINEAR_HEAP_SIZE);
         Scheduler scheduler = new Scheduler();
-        SvcTable svcTable = new SvcTable(memory, log, false, handles, memoryManager, scheduler);
+        ServiceRegistry serviceRegistry = new ServiceRegistry();
+        SvcTable svcTable = new SvcTable(memory, log, false, handles, memoryManager, scheduler, serviceRegistry);
         ArmCore core = new ArmCore(memory, svcTable.dispatcher(), ArmArchitecture.ARM11_MPCORE);
         svcTable.attach(core);
         N3dsCp15 cp15 = new N3dsCp15();
         core.setCoprocessorBus(cp15);
         scheduler.attach(core, cp15, mainThread);
-        return new Harness(memory, core, svcTable, handles, scheduler, mainThread, captured);
+        return new Harness(memory, core, svcTable, handles, scheduler, mainThread, captured, serviceRegistry);
     }
 
     /// Grava `svc #svcNumber` em `CODE_BASE` e devolve o `CpuState` de entrada correspondente
@@ -490,22 +492,67 @@ class SvcTableTest {
         assertEquals(new SessionObject(portName), h.handles().resolve(result.r1()).orElseThrow());
     }
 
+    /// **G3**: ao contrário da G2 (que lançava na primeira `svcSendSyncRequest` real, "não
+    /// inclui" daquela task), esta SVC agora despacha de verdade — mas uma sessão sobre uma
+    /// PORTA sem serviço registrado (nenhum registrado neste harness isolado) não deve lançar:
+    /// loga e escreve um erro genérico no buffer (mesma política de "nunca travar" da G3, ver
+    /// Javadoc de {@link SvcTable#handleSendSyncRequest}), com `r0=SUCCESS` (a SVC em si
+    /// funcionou — o erro é IPC-level, no buffer, não no valor de retorno da svc).
     @Test
-    void sendSyncRequestLogaOCabecalhoIpcELanca() {
+    void sendSyncRequestSemServicoRegistradoNaoLancaEEscreveErroGenericoNoBuffer() {
         Harness h = newHarness();
-        CpuState session = dispatch(h, 0x2D, 0, DATA_BASE, 0, 0); // porta vazia, sem nome escrito
+        String portName = "sem-svc:U"; // <= 11 chars (3dbrew: nome de porta, MAX_PORT_NAME_LENGTH)
+        byte[] bytes = portName.getBytes(StandardCharsets.UTF_8);
+        for (int i = 0; i < bytes.length; i++) {
+            h.memory().write8(DATA_BASE + i, bytes[i]);
+        }
+        h.memory().write8(DATA_BASE + bytes.length, (byte) 0);
+        CpuState session = dispatch(h, 0x2D, 0, DATA_BASE, 0, 0);
         int tls = h.mainThread().tlsAddress();
         int header = (0x1234 << 16); // comando 0x1234, 0 params
         h.memory().write32(tls + dev.vitorsilverio.n3dsemu.memory.MemoryMap.TLS_COMMAND_BUFFER_OFFSET, header);
 
-        h.memory().write32(CODE_BASE, ARM_SVC_OPCODE_BASE | 0x32);
-        CpuState state = new CpuState(session.r1(), 0, 0, 0, 0, 0, CODE_BASE + ARM_INSTRUCTION_SIZE, 0);
+        CpuState result = dispatch(h, 0x32, session.r1(), 0, 0, 0);
 
-        UnsupportedSvcException thrown = org.junit.jupiter.api.Assertions.assertThrows(
-                UnsupportedSvcException.class, () -> h.svcTable().dispatcher().dispatch(0, state));
+        assertEquals(Result.SUCCESS.code(), result.r0());
+        int responseHeader = h.memory().read32(tls + dev.vitorsilverio.n3dsemu.memory.MemoryMap.TLS_COMMAND_BUFFER_OFFSET);
+        int responseResult = h.memory().read32(tls + dev.vitorsilverio.n3dsemu.memory.MemoryMap.TLS_COMMAND_BUFFER_OFFSET + 4);
+        assertEquals(0x1234, responseHeader >>> 16);
+        assertEquals(Result.SERVICE_COMMAND_NOT_IMPLEMENTED.code(), responseResult);
+        assertTrue(h.stdout().toString(StandardCharsets.UTF_8).contains(portName));
+    }
 
-        assertEquals(0x32, thrown.call().number());
-        assertTrue(h.stdout().toString(StandardCharsets.UTF_8).contains("0x1234"));
+    @Test
+    void sendSyncRequestDespachaParaOServicoRegistrado() {
+        Harness h = newHarness();
+        String portName = "eco:U";
+        byte[] bytes = portName.getBytes(StandardCharsets.UTF_8);
+        for (int i = 0; i < bytes.length; i++) {
+            h.memory().write8(DATA_BASE + i, bytes[i]);
+        }
+        h.memory().write8(DATA_BASE + bytes.length, (byte) 0);
+        h.serviceRegistry().register(new dev.vitorsilverio.n3dsemu.service.Service() {
+            @Override
+            public String name() {
+                return portName;
+            }
+
+            @Override
+            public void handleRequest(dev.vitorsilverio.n3dsemu.ipc.IpcRequest request,
+                                       dev.vitorsilverio.n3dsemu.ipc.IpcResponse response) {
+                response.header(request.commandId(), 1, 0);
+                response.result(Result.SUCCESS);
+            }
+        });
+        CpuState session = dispatch(h, 0x2D, 0, DATA_BASE, 0, 0);
+        int tls = h.mainThread().tlsAddress();
+        h.memory().write32(tls + dev.vitorsilverio.n3dsemu.memory.MemoryMap.TLS_COMMAND_BUFFER_OFFSET, 0x9999 << 16);
+
+        CpuState result = dispatch(h, 0x32, session.r1(), 0, 0, 0);
+
+        assertEquals(Result.SUCCESS.code(), result.r0());
+        int responseResult = h.memory().read32(tls + dev.vitorsilverio.n3dsemu.memory.MemoryMap.TLS_COMMAND_BUFFER_OFFSET + 4);
+        assertEquals(Result.SUCCESS.code(), responseResult);
     }
 
     @Test

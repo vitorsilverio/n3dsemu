@@ -24,12 +24,24 @@ import java.nio.ByteOrder;
 /// corrigida contém, nos 28 bits baixos, um deslocamento **combinado** dentro do layout
 /// code+rodata+data (0 = início do código, `codeSegSize` = início do rodata, e assim por
 /// diante) — por construção esse deslocamento combinado já é exatamente `endereço -
-/// loadBase`, então traduzi-lo é simplesmente somar {@link #LOAD_BASE} (o carregador de
-/// referência faz isso com uma busca por segmento porque monta os três ponteiros
-/// separadamente antes de saber que eles são contíguos; aqui, como os três segmentos SÃO
-/// carregados contíguos, a soma direta é equivalente e mais simples). Os 4 bits altos são o
-/// `subType`: só usado no tipo relativo, para decidir se o bit de sinal do resultado é
-/// preservado (`subType=0`) ou zerado (`subType=1`).
+/// loadBase`, então traduzi-lo é simplesmente somar {@link #LOAD_BASE}.
+///
+/// **Achado real (G3, `tasks/g3-servicos-srv-apt-hid-fs.md`): os segmentos NÃO são contíguos
+/// pelo tamanho bruto do arquivo — cada um é arredondado para cima até {@link
+/// #SEGMENT_ALIGNMENT} (0x1000) antes do próximo começar**, exatamente como o carregador real
+/// separa code/rodata/data em regiões de permissão de memória distintas (RX/R/RW, cada uma
+/// alinhada a página). O Javadoc anterior desta classe (G1) assumia contiguidade pelo tamanho
+/// bruto — verificado ERRADO nesta sessão: `srvInit` do `read-controls.3dsx` real carrega um
+/// ponteiro para a string `"srv:"` (rodata) que só bate com `LOAD_BASE + roundUp(codeSegSize,
+/// 0x1000) + <deslocamento dentro do rodata do arquivo>` — confirmado via
+/// `arm-none-eabi-objdump` no `.3dsx` real e busca binária da string no arquivo, não por
+/// analogia (a diferença entre as duas hipóteses batia exatamente com o padding de
+/// `codeSegSize` até a página seguinte). {@link #segmentOffset} centraliza esse arredondamento
+/// — usado tanto para computar {@code segmentFileOffsets} (relocação relativa) quanto por
+/// {@link dev.vitorsilverio.n3dsemu.memory.N3dsAddressSpace}, que precisa montar a imagem em
+/// memória com o MESMO espaçamento entre segmentos para os ponteiros relocados baterem. Os 4
+/// bits altos do valor bruto são o `subType`: só usado no tipo relativo, para decidir se o bit
+/// de sinal do resultado é preservado (`subType=0`) ou zerado (`subType=1`).
 public final class Loader3dsx {
     private static final int MAGIC = 0x58534433; // "3DSX" little-endian
 
@@ -62,6 +74,14 @@ public final class Loader3dsx {
     /// Base de carga fixa do 3DSX no 3DS (RFC-N3DSEMU §3 e §4): sempre `0x00100000`, sem
     /// ASLR nem pedido de endereço pelo arquivo. Também o ponto de entrada.
     public static final int LOAD_BASE = 0x0010_0000;
+
+    /// Granularidade de alinhamento entre segmentos (code→rodata→data) do carregador real —
+    /// mesma granularidade de página do ARM11 MPCore (`0x1000`), porque cada segmento vira uma
+    /// região de memória com permissão própria (RX/R/RW). Ver Javadoc da classe ("Achado real
+    /// G3") — sem este arredondamento, ponteiros relocados para dentro do rodata/data ficam
+    /// errados por exatamente `roundUp(codeSegSize, SEGMENT_ALIGNMENT) - codeSegSize` bytes (e
+    /// de novo para o data, pelo resto do rodata).
+    public static final int SEGMENT_ALIGNMENT = 0x1000;
 
     /// Analisa e relocaliza `file`, devolvendo os três segmentos já com os ponteiros
     /// corrigidos para {@link #LOAD_BASE}.
@@ -129,7 +149,10 @@ public final class Loader3dsx {
         cursor += dataFileSize;
 
         byte[][] segments = {code, rodata, dataWithBss};
-        int[] segmentFileOffsets = {0, codeSegSize, codeSegSize + rodataSegSize};
+        // Ver Javadoc da classe ("Achado real G3"): deslocamento de cada segmento na imagem
+        // MONTADA (com padding de alinhamento entre segmentos), não a soma bruta dos tamanhos
+        // do arquivo.
+        int[] segmentFileOffsets = {0, segmentOffset(codeSegSize), segmentOffset(codeSegSize) + segmentOffset(rodataSegSize)};
 
         for (int segment = 0; segment < SEGMENT_COUNT; segment++) {
             for (int table = 0; table < nRelocTables; table++) {
@@ -174,6 +197,12 @@ public final class Loader3dsx {
             }
         }
         return cursor;
+    }
+
+    /// Arredonda `segmentSize` para cima até {@link #SEGMENT_ALIGNMENT} — a distância que o
+    /// PRÓXIMO segmento fica do início deste na imagem MONTADA (ver Javadoc da classe).
+    public static int segmentOffset(int segmentSize) {
+        return (segmentSize + SEGMENT_ALIGNMENT - 1) & ~(SEGMENT_ALIGNMENT - 1);
     }
 
     private static byte[] readSegment(byte[] file, int offset, int length, String name) {

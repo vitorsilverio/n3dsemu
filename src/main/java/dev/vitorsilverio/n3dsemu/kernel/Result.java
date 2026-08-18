@@ -106,6 +106,13 @@ public record Result(int description, int module, int summary, int level) {
     public static final Result NOT_LOCK_OWNER =
             new Result(DESCRIPTION_NOT_LOCK_OWNER_PLACEHOLDER, MODULE_KERNEL, SUMMARY_INVALID_ARGUMENT, LEVEL_PERMANENT);
 
+    /// Comando IPC desconhecido dentro de um serviço conhecido (RFC-N3DSEMU G3 — política
+    /// deliberadamente oposta à da G2: nunca lançar, só logar e devolver um erro genérico para
+    /// o guest seguir em frente). Mesmos campos de {@link #MEMORY_REGION_NOT_FOUND} — o
+    /// significado ("não encontrado") é o mesmo, só o nome muda para refletir o uso em IPC.
+    public static final Result SERVICE_COMMAND_NOT_IMPLEMENTED =
+            new Result(DESCRIPTION_NOT_FOUND, MODULE_KERNEL, SUMMARY_NOT_FOUND, LEVEL_PERMANENT);
+
     /// Empacota os quatro campos no `u32` que vai para `r0`.
     public int code() {
         return (description << DESCRIPTION_SHIFT)

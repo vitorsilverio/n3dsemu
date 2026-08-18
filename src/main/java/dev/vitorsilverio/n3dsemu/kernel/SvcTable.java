@@ -3,9 +3,15 @@ package dev.vitorsilverio.n3dsemu.kernel;
 import dev.vitorsilverio.armjitter.core.ArmCore;
 import dev.vitorsilverio.armjitter.core.CpsrRegister;
 import dev.vitorsilverio.armjitter.memory.AddressSpace;
+import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.armjitter.swi.CpuState;
 import dev.vitorsilverio.armjitter.swi.SwiDispatcher;
+import dev.vitorsilverio.n3dsemu.ipc.IpcCommandHeader;
+import dev.vitorsilverio.n3dsemu.ipc.IpcRequest;
+import dev.vitorsilverio.n3dsemu.ipc.IpcResponse;
 import dev.vitorsilverio.n3dsemu.memory.MemoryMap;
+import dev.vitorsilverio.n3dsemu.service.Service;
+import dev.vitorsilverio.n3dsemu.service.ServiceRegistry;
 
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
@@ -118,12 +124,6 @@ public final class SvcTable {
     /// 3dbrew: nomes de porta têm no máximo 11 caracteres + terminador nulo.
     private static final int MAX_PORT_NAME_LENGTH = 11;
 
-    // Layout do cabeçalho de comando IPC (RFC §3: buffer em TLS+0x80; 3dbrew: "IPC Request/
-    // Response structure") — só usado para o log de `svcSendSyncRequest` (diagnóstico, nunca
-    // decodificado em profundidade nesta task).
-    private static final int IPC_COMMAND_ID_SHIFT = 16;
-    private static final int IPC_NORMAL_PARAMS_SHIFT = 6;
-    private static final int IPC_PARAM_COUNT_MASK = 0x3F;
 
     /// `PageInfo::flags` não tem nenhum uso documentado conhecido — o Horizon real sempre
     /// devolve `0` (3dbrew: `SVC` não lista nenhum bit definido).
@@ -152,15 +152,18 @@ public final class SvcTable {
     private final HandleTable handles;
     private final MemoryManager memoryManager;
     private final Scheduler scheduler;
+    private final ServiceRegistry serviceRegistry;
     private ArmCore core;
 
     public SvcTable(AddressSpace memory, PrintStream traceLog, boolean traceEnabled,
-                     HandleTable handles, MemoryManager memoryManager, Scheduler scheduler) {
-        this(memory, traceLog, traceEnabled, DEFAULT_TRACE_CAPACITY, handles, memoryManager, scheduler);
+                     HandleTable handles, MemoryManager memoryManager, Scheduler scheduler,
+                     ServiceRegistry serviceRegistry) {
+        this(memory, traceLog, traceEnabled, DEFAULT_TRACE_CAPACITY, handles, memoryManager, scheduler, serviceRegistry);
     }
 
     public SvcTable(AddressSpace memory, PrintStream traceLog, boolean traceEnabled, int traceCapacity,
-                     HandleTable handles, MemoryManager memoryManager, Scheduler scheduler) {
+                     HandleTable handles, MemoryManager memoryManager, Scheduler scheduler,
+                     ServiceRegistry serviceRegistry) {
         this.memory = Objects.requireNonNull(memory, "memory");
         this.traceLog = Objects.requireNonNull(traceLog, "traceLog");
         this.traceEnabled = traceEnabled;
@@ -168,6 +171,7 @@ public final class SvcTable {
         this.handles = Objects.requireNonNull(handles, "handles");
         this.memoryManager = Objects.requireNonNull(memoryManager, "memoryManager");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
+        this.serviceRegistry = Objects.requireNonNull(serviceRegistry, "serviceRegistry");
     }
 
     /// Liga esta tabela ao {@link ArmCore} que a criou (necessário para ler/gravar registradores
@@ -223,7 +227,7 @@ public final class SvcTable {
             case SVC_DUPLICATE_HANDLE -> handleDuplicateHandle(state);
             case SVC_GET_SYSTEM_TICK -> handleGetSystemTick(state);
             case SVC_CONNECT_TO_PORT -> handleConnectToPort(state);
-            case SVC_SEND_SYNC_REQUEST -> throw handleSendSyncRequest(state);
+            case SVC_SEND_SYNC_REQUEST -> handleSendSyncRequest(state);
             case SVC_GET_PROCESS_ID -> handleGetProcessId(state);
             case SVC_GET_THREAD_ID -> handleGetThreadId(state);
             case SVC_GET_RESOURCE_LIMIT -> handleGetResourceLimit(state);
@@ -434,12 +438,24 @@ public final class SvcTable {
     }
 
     /// `svcMapMemoryBlock` — kernel real (igual à assinatura C): `r0`=handle, `r1`=`addr`,
-    /// `r2`=`my_perm`, `r3`=`other_perm`. Sem MMU (RFC D2): validação de handle só — mesma
-    /// simplificação de `MemoryManager#controlMemory` para `MEMOP_MAP`/`UNMAP`.
+    /// `r2`=`my_perm`, `r3`=`other_perm`. Sem MMU (RFC D2): validação de handle só para blocos
+    /// do GUEST (já têm RAM de verdade por trás desde o commit do heap) — **G3**: para blocos
+    /// DO SERVIDOR (`MemoryBlockObject#serverOwned`, ex.: memória compartilhada de `hid:USER`/
+    /// `gsp::Gpu`), o endereço só existe quando o guest escolhe onde mapear; a primeira chamada
+    /// cria RAM de backing de verdade nesse endereço (ver Javadoc de
+    /// {@link MemoryBlockObject#serverOwned}) — sem isso, ler/escrever ali cairia no barramento
+    /// aberto em vez de numa página real.
     private CpuState handleMapMemoryBlock(CpuState state) {
         Optional<KernelObject> object = handles.resolve(state.r0());
-        if (object.isEmpty() || !(object.get() instanceof MemoryBlockObject)) {
+        if (object.isEmpty() || !(object.get() instanceof MemoryBlockObject block)) {
             return state.withR0(Result.INVALID_HANDLE.code());
+        }
+        if (block.serverOwned() && !block.hostMapped()) {
+            int requestedAddress = state.r1();
+            int alignedAddress = requestedAddress & ~(MemoryMap.PAGE_SIZE - 1);
+            int alignedSize = (block.size() + MemoryMap.PAGE_SIZE - 1) & ~(MemoryMap.PAGE_SIZE - 1);
+            ((PagedAddressSpace) memory).mapRam(alignedAddress, new byte[alignedSize]);
+            block.bindHostBacking(requestedAddress);
         }
         return state.withR0(Result.SUCCESS.code());
     }
@@ -569,25 +585,39 @@ public final class SvcTable {
                 state.sp(), state.lr(), state.pc(), state.cpsr());
     }
 
-    /// `svcSendSyncRequest` — kernel real: `r0`=handle de sessão. **Não implementada de
-    /// verdade** (RFC/task "não inclui": serviços são a G3) — loga o cabeçalho de comando IPC
-    /// (lido de TLS+{@link MemoryMap#TLS_COMMAND_BUFFER_OFFSET} da thread CORRENTE, RFC §3) e
-    /// lança, mesmo padrão de {@link #defaultUnsupported} (grava sucesso em `r0` antes, ver
-    /// Javadoc daquele método).
-    private UnsupportedSvcException handleSendSyncRequest(CpuState state) {
+    /// `svcSendSyncRequest` — kernel real: `r0`=handle de sessão. **G3**: despacha de verdade
+    /// para o {@link Service} registrado sob o nome da porta/serviço da sessão (ver
+    /// {@link ServiceRegistry}) — ao contrário da G2 (que só logava o cabeçalho e lançava), esta
+    /// SVC agora sempre TERMINA COM SUCESSO do ponto de vista do kernel (`r0=SUCCESS`); o
+    /// resultado de verdade da chamada IPC vai no buffer de comando, escrito pelo próprio
+    /// {@link Service} (ver Javadoc de {@link IpcResponse}) — svc "falhar" só faz sentido para
+    /// handle inválida (não é o caso de nenhum serviço desconhecido, ver abaixo).
+    ///
+    /// **Sessão sem serviço registrado**: loga e escreve uma resposta de erro genérica no
+    /// buffer (mesma política de "nunca travar" do resto da G3) — nunca lança, ao contrário da
+    /// G2 (ver Javadoc da classe, "oposto da política da G2").
+    private CpuState handleSendSyncRequest(CpuState state) {
         Optional<KernelObject> object = handles.resolve(state.r0());
-        String sessionName = object.map(KernelObject::debugName)
-                .orElse("handle desconhecida 0x" + Integer.toHexString(state.r0()));
+        String sessionName = object.filter(SessionObject.class::isInstance)
+                .map(o -> ((SessionObject) o).portName())
+                .orElse(null);
         int tls = scheduler.current().tlsAddress();
-        int header = memory.read32(tls + MemoryMap.TLS_COMMAND_BUFFER_OFFSET);
-        int commandId = header >>> IPC_COMMAND_ID_SHIFT;
-        int normalParams = (header >>> IPC_NORMAL_PARAMS_SHIFT) & IPC_PARAM_COUNT_MASK;
-        int translateParams = header & IPC_PARAM_COUNT_MASK;
-        traceLog.println("[ipc] svcSendSyncRequest sessao=%s cmd=0x%04X normais=%d traduzidos=%d"
-                .formatted(sessionName, commandId, normalParams, translateParams));
-        core.setRegister(REGISTER_R0, RESULT_SUCCESS_PLACEHOLDER);
-        return new UnsupportedSvcException(
-                new SvcCall(SVC_SEND_SYNC_REQUEST, HorizonSvcNames.nameOf(SVC_SEND_SYNC_REQUEST), state.r0(), 0, state.pc()));
+        int bufferAddress = tls + MemoryMap.TLS_COMMAND_BUFFER_OFFSET;
+
+        Optional<Service> service = sessionName == null ? Optional.empty() : serviceRegistry.resolve(sessionName);
+        if (service.isEmpty()) {
+            traceLog.println("[ipc] svcSendSyncRequest sessao=" + (sessionName != null ? sessionName
+                    : "handle desconhecida 0x" + Integer.toHexString(state.r0())) + " — nenhum serviço registrado");
+            IpcResponse errorResponse = new IpcResponse(memory, bufferAddress);
+            int commandId = IpcCommandHeader.commandId(memory.read32(bufferAddress));
+            errorResponse.header(commandId, 1, 0);
+            errorResponse.result(Result.SERVICE_COMMAND_NOT_IMPLEMENTED);
+        } else {
+            IpcRequest request = new IpcRequest(memory, bufferAddress);
+            IpcResponse response = new IpcResponse(memory, bufferAddress);
+            service.get().handleRequest(request, response);
+        }
+        return state.withR0(Result.SUCCESS.code());
     }
 
     private String readCString(int address, int maxLength) {

@@ -2,6 +2,7 @@ package dev.vitorsilverio.n3dsemu.memory;
 
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.n3dsemu.loader.Image3dsx;
+import dev.vitorsilverio.n3dsemu.loader.Loader3dsx;
 
 import java.io.PrintStream;
 
@@ -32,20 +33,35 @@ public final class N3dsAddressSpace {
         return memory;
     }
 
+    /// Tamanho da região CODE+RODATA+DATA como ela é MONTADA na memória (não a soma bruta dos
+    /// 3 tamanhos do arquivo `.3dsx`) — código e rodata terminam alinhados a
+    /// {@link Loader3dsx#SEGMENT_ALIGNMENT} (mesmo achado real documentado em
+    /// {@link Loader3dsx}, "Achado real G3": os ponteiros relocados pressupõem esse
+    /// espaçamento), então a região é maior que `image.totalSize()` sempre que code/rodata não
+    /// caem exatamente numa fronteira de 0x1000. Usado tanto por {@link #buildExecutableImage}
+    /// quanto por `N3dsMachine` (bookkeeping do `MemoryManager` para `svcQueryMemory`) — as
+    /// duas contas TÊM que bater, senão o `MemoryManager` reporta um tamanho de região CODE
+    /// menor que o que está de fato mapeado.
+    public static int executableRegionSize(Image3dsx image) {
+        return Loader3dsx.segmentOffset(image.code().length)
+                + Loader3dsx.segmentOffset(image.rodata().length)
+                + image.dataWithBss().length;
+    }
+
     // PagedAddressSpace.mapRam exige um backing múltiplo de pageSize; o tamanho real do
-    // executável (soma dos 3 segmentos) quase nunca é — completa com zeros até a fronteira
-    // de página seguinte (o resto vira BSS/folga, nunca lido pelo guest se o linker gerou o
-    // .3dsx corretamente).
+    // executável (com o espaçamento entre segmentos acima) quase nunca é — completa com zeros
+    // até a fronteira de página seguinte (o resto vira BSS/folga, nunca lido pelo guest se o
+    // linker gerou o .3dsx corretamente).
     private static byte[] buildExecutableImage(Image3dsx image) {
-        int rawSize = image.totalSize();
+        int rawSize = executableRegionSize(image);
         int paddedSize = (rawSize + MemoryMap.PAGE_SIZE - 1) & ~(MemoryMap.PAGE_SIZE - 1);
         byte[] combined = new byte[paddedSize];
-        int cursor = 0;
-        System.arraycopy(image.code(), 0, combined, cursor, image.code().length);
-        cursor += image.code().length;
-        System.arraycopy(image.rodata(), 0, combined, cursor, image.rodata().length);
-        cursor += image.rodata().length;
-        System.arraycopy(image.dataWithBss(), 0, combined, cursor, image.dataWithBss().length);
+        int codeOffset = 0;
+        int rodataOffset = Loader3dsx.segmentOffset(image.code().length);
+        int dataOffset = rodataOffset + Loader3dsx.segmentOffset(image.rodata().length);
+        System.arraycopy(image.code(), 0, combined, codeOffset, image.code().length);
+        System.arraycopy(image.rodata(), 0, combined, rodataOffset, image.rodata().length);
+        System.arraycopy(image.dataWithBss(), 0, combined, dataOffset, image.dataWithBss().length);
         return combined;
     }
 }
