@@ -99,6 +99,25 @@ public final class GspGpuService extends AbstractService {
     private static final int INTERRUPT_TYPE_PDC0_VBLANK_TOP = 2;
     private static final int U8_MASK = 0xFF;
 
+    /// `FrameBufferUpdate` (3dbrew "GSP Shared Memory"; layout confirmado por `WebFetch` na wiki
+    /// ao investigar a G4 "tela toda preta" — libctru 2.7.0 real NÃO chama `GSPGPU:SetBufferSwap`
+    /// por IPC a cada quadro: `gfxSwapBuffersGpu`/`GSPGPU_SetBufferSwap` (a função C) escreve
+    /// direto nesta struct em memória compartilhada — `sharedMemBase + 0x200 + clientID*0x80`
+    /// (topo) / `+0x240` (baixo) — e só sinaliza via `is_dirty`; a IPC de mesmo nome existe mas
+    /// nenhum app moderno a usa mais. Sem ler este bloco, {@link #frameBufferState} nunca era
+    /// populado e a tela ficava preta para sempre, mesmo com o guest rodando e desenhando
+    /// normalmente. Bloco de 0x40 bytes: 1 byte índice + 1 byte `is_dirty` + 2 bytes de padding +
+    /// 2 entradas `FrameBufferInfo` de 7 palavras (28 bytes) cada.
+    private static final int FRAMEBUFFER_UPDATE_TOP_OFFSET = 0x200;
+    private static final int FRAMEBUFFER_UPDATE_BOTTOM_OFFSET = 0x240;
+    private static final int FRAMEBUFFER_UPDATE_INDEX_OFFSET = 0x0;
+    private static final int FRAMEBUFFER_UPDATE_DIRTY_OFFSET = 0x1;
+    private static final int FRAMEBUFFER_UPDATE_ENTRIES_OFFSET = 0x4;
+    private static final int FRAMEBUFFER_INFO_ENTRY_SIZE = 0x1C;
+    private static final int FRAMEBUFFER_INFO_ADDRESS_LEFT_OFFSET = 0x4;
+    private static final int FRAMEBUFFER_INFO_STRIDE_OFFSET = 0xC;
+    private static final int FRAMEBUFFER_INFO_FORMAT_OFFSET = 0x10;
+
     /// `GSPGPU_SetBufferSwap(u8 screenId, GSPGPU_FramebufferInfo const* info)` — layout do IPC
     /// (3dbrew: `GSPGPU:SetBufferSwap`, `GSP_Shared_Memory` para os campos da struct): palavra 0
     /// = id da tela (0=`TOP`,1=`BOTTOM`), palavras 1-7 = `GSPGPU_FramebufferInfo` (28 bytes/7
@@ -201,6 +220,8 @@ public final class GspGpuService extends AbstractService {
     void onVBlank() {
         Object resolvedBlock = handles.resolve(gspSharedMemoryHandle).orElse(null);
         if (resolvedBlock instanceof MemoryBlockObject block && block.hostMapped()) {
+            readFramebufferUpdate(block.address() + FRAMEBUFFER_UPDATE_TOP_OFFSET, Screen.TOP);
+            readFramebufferUpdate(block.address() + FRAMEBUFFER_UPDATE_BOTTOM_OFFSET, Screen.BOTTOM);
             pushInterrupt(block.address(), INTERRUPT_TYPE_PDC0_VBLANK_TOP);
         }
         if (interruptEvent != null) {
@@ -218,6 +239,23 @@ public final class GspGpuService extends AbstractService {
     /// (RFC/task: "`runSlice()` até o `gsp` sinalizar VBlank").
     public void setVBlankListener(Runnable listener) {
         this.vBlankListener = listener;
+    }
+
+    /// Lê o `FrameBufferUpdate` de uma tela (ver Javadoc das constantes `FRAMEBUFFER_UPDATE_*`) e,
+    /// se o app marcou `is_dirty`, aplica a entrada ativa em {@link #frameBufferState} e limpa a
+    /// flag — o caminho real que substitui `GSPGPU:SetBufferSwap` por IPC no libctru moderno.
+    private void readFramebufferUpdate(int updateBase, Screen screen) {
+        int dirty = memory.read8(updateBase + FRAMEBUFFER_UPDATE_DIRTY_OFFSET) & U8_MASK;
+        if (dirty == 0) {
+            return;
+        }
+        int index = memory.read8(updateBase + FRAMEBUFFER_UPDATE_INDEX_OFFSET) & U8_MASK;
+        int entryBase = updateBase + FRAMEBUFFER_UPDATE_ENTRIES_OFFSET + index * FRAMEBUFFER_INFO_ENTRY_SIZE;
+        int leftVaddr = memory.read32(entryBase + FRAMEBUFFER_INFO_ADDRESS_LEFT_OFFSET);
+        int stride = memory.read32(entryBase + FRAMEBUFFER_INFO_STRIDE_OFFSET);
+        PixelFormat format = PixelFormat.fromCode(memory.read32(entryBase + FRAMEBUFFER_INFO_FORMAT_OFFSET));
+        frameBufferState.update(screen, leftVaddr, stride, format);
+        memory.write8(updateBase + FRAMEBUFFER_UPDATE_DIRTY_OFFSET, 0);
     }
 
     /// Escreve uma entrada na fila circular de interrupções (3dbrew: GSP Shared Memory) e avança

@@ -18,6 +18,14 @@ public final class ServiceRegistry {
         services.put(Objects.requireNonNull(service, "service").name(), service);
     }
 
+    /// Registra a mesma instância sob um nome de porta adicional (ex.: `APT:S`/`APT:A`
+    /// apontando para a mesma {@link AptService} de `APT:U` — o `aptInit` real do libctru abre
+    /// sessões separadas para os três nomes, mas todas falam com o mesmo serviço do lado do
+    /// sistema real; nosso HLE mínimo não distingue comportamento entre eles).
+    public void registerAlias(String name, Service service) {
+        services.put(Objects.requireNonNull(name, "name"), Objects.requireNonNull(service, "service"));
+    }
+
     public Optional<Service> resolve(String name) {
         return Optional.ofNullable(services.get(name));
     }

@@ -131,7 +131,14 @@ public final class N3dsMachine {
         HidService hidService = new HidService(diagnosticLog, memory, handles, inputState, inputScript);
         GspGpuService gspGpuService = new GspGpuService(diagnosticLog, memory, handles, scheduler, hidService);
         serviceRegistry.register(new SrvService(diagnosticLog, handles, serviceRegistry));
-        serviceRegistry.register(new AptService(diagnosticLog, handles));
+        AptService aptService = new AptService(diagnosticLog, handles);
+        serviceRegistry.register(aptService);
+        // aptInit real (libctru) abre 3 sessões (APT:U/APT:S/APT:A) para o mesmo serviço do
+        // lado do sistema — sem os aliases, GetServiceHandle("APT:S") falhava e aptInit
+        // abortava antes do guest desenhar qualquer coisa (achado ao validar G4 com
+        // hello-world.3dsx: janela abria em preto, sem texto).
+        serviceRegistry.registerAlias("APT:S", aptService);
+        serviceRegistry.registerAlias("APT:A", aptService);
         serviceRegistry.register(hidService);
         serviceRegistry.register(new FsUserService(diagnosticLog));
         serviceRegistry.register(gspGpuService);
