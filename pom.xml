@@ -21,7 +21,23 @@
         <maven.compiler.target>25</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.12.2</junit.version>
+        <!-- G4: confira a última estável em https://www.lwjgl.org/customize ao executar. -->
+        <lwjgl.version>3.3.6</lwjgl.version>
+        <!-- Sobrescrito pelos profiles de SO abaixo. -->
+        <lwjgl.natives>natives-windows</lwjgl.natives>
     </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.lwjgl</groupId>
+                <artifactId>lwjgl-bom</artifactId>
+                <version>${lwjgl.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <dependency>
@@ -29,6 +45,44 @@
             <artifactId>arm-jitter</artifactId>
             <version>1.0.0</version>
         </dependency>
+
+        <!-- G4: janela GLFW + Vulkan (RFC-N3DSEMU D4 — sem backend de software). -->
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl</artifactId>
+            <classifier>${lwjgl.natives}</classifier>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-glfw</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-glfw</artifactId>
+            <classifier>${lwjgl.natives}</classifier>
+        </dependency>
+        <!-- lwjgl-vulkan: SEM classifier de natives no Windows/Linux — o carregador Vulkan é o
+             do sistema (vulkan-1.dll / libvulkan.so). Só macOS precisa de natives-macos-arm64
+             (MoltenVK), adicionado só no profile daquele SO. Declarar aqui quebra o build nos
+             outros dois SOs (artefato inexistente). -->
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-vulkan</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-shaderc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-shaderc</artifactId>
+            <classifier>${lwjgl.natives}</classifier>
+        </dependency>
+
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
@@ -36,6 +90,32 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <profiles>
+        <profile>
+            <id>lwjgl-natives-windows</id>
+            <activation><os><family>windows</family></os></activation>
+            <properties><lwjgl.natives>natives-windows</lwjgl.natives></properties>
+        </profile>
+        <profile>
+            <id>lwjgl-natives-linux</id>
+            <activation><os><family>unix</family><name>linux</name></os></activation>
+            <properties><lwjgl.natives>natives-linux</lwjgl.natives></properties>
+        </profile>
+        <profile>
+            <id>lwjgl-natives-macos</id>
+            <activation><os><family>mac</family></os></activation>
+            <properties><lwjgl.natives>natives-macos-arm64</lwjgl.natives></properties>
+            <dependencies>
+                <!-- MoltenVK: único SO em que lwjgl-vulkan tem artefato de natives. -->
+                <dependency>
+                    <groupId>org.lwjgl</groupId>
+                    <artifactId>lwjgl-vulkan</artifactId>
+                    <classifier>natives-macos-arm64</classifier>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
 
     <build>
         <plugins>

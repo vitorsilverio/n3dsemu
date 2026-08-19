@@ -1,6 +1,9 @@
 package dev.vitorsilverio.n3dsemu.service;
 
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
+import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
+import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
+import dev.vitorsilverio.n3dsemu.gpu.Screen;
 import dev.vitorsilverio.n3dsemu.input.InputState;
 import dev.vitorsilverio.n3dsemu.ipc.IpcCommandHeader;
 import dev.vitorsilverio.n3dsemu.ipc.IpcRequest;
@@ -130,5 +133,38 @@ class GspGpuServiceTest {
         // chamada, não ambas no slot 0 nem no slot do cursor de leitura avançado incorretamente.
         assertEquals(pdc0VBlankTop, h.memory().read8(SHARED_MEMORY_ADDRESS + entriesOffset) & 0xFF);
         assertEquals(pdc0VBlankTop, h.memory().read8(SHARED_MEMORY_ADDRESS + entriesOffset + 1) & 0xFF);
+    }
+
+    private static final int CMD_SET_BUFFER_SWAP = 0x5;
+
+    /// RFC-N3DSEMU G4: antes desta task, `SetBufferSwap` era um sucesso trivial que descartava
+    /// os parâmetros — o laço de apresentação (`Main`) precisa saber ONDE está o framebuffer
+    /// ativo de cada tela para poder ler a memória do guest a cada VBlank.
+    @Test
+    void setBufferSwapGravaOBufferAtivoDaTelaEmFrameBufferState() {
+        Harness h = newHarness();
+        int leftVaddr = 0x1800_0000;
+        int stride = 240 * 3;
+        int format = PixelFormat.RGB8.code();
+
+        h.memory().write32(BUFFER_ADDRESS, IpcCommandHeader.pack(CMD_SET_BUFFER_SWAP, 8, 0));
+        h.memory().write32(BUFFER_ADDRESS + 4, 0); // screenId=0 (TOP)
+        h.memory().write32(BUFFER_ADDRESS + 8, 0); // active_fb
+        h.memory().write32(BUFFER_ADDRESS + 12, leftVaddr);
+        h.memory().write32(BUFFER_ADDRESS + 16, 0); // right vaddr (sem 3D, RFC D6)
+        h.memory().write32(BUFFER_ADDRESS + 20, stride);
+        h.memory().write32(BUFFER_ADDRESS + 24, format);
+        h.memory().write32(BUFFER_ADDRESS + 28, 0); // mode
+        h.memory().write32(BUFFER_ADDRESS + 32, 0); // attribute
+        IpcRequest request = new IpcRequest(h.memory(), BUFFER_ADDRESS);
+        IpcResponse response = new IpcResponse(h.memory(), BUFFER_ADDRESS);
+
+        h.gsp().handleRequest(request, response);
+
+        FrameBufferState.Buffer buffer = h.gsp().frameBufferState().active(Screen.TOP);
+        assertEquals(leftVaddr, buffer.address());
+        assertEquals(stride, buffer.stride());
+        assertEquals(PixelFormat.RGB8, buffer.format());
+        assertEquals(0, h.memory().read32(BUFFER_ADDRESS + 4)); // Result.SUCCESS
     }
 }

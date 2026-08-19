@@ -7,10 +7,11 @@ Emulador de **Nintendo 3DS** em Java 25, irmão do [`gbaemu`](../gbaemu) e do
 (JIT + interpretador de debug). Decisões de projeto em
 `arm-jitter/tasks/trilha-g-3ds/RFC-N3DSEMU.md`.
 
-> Estado: **marco M1** (task G1) — carrega um `.3dsx` homebrew, executa código ARMv6K real do
-> ARM11 (preset `ArmArchitecture.ARM11_MPCORE`) e chega à primeira `svc` do kernel Horizon,
-> com trace legível e nomes reais de SVC. Kernel em HLE (sem MMU, sem LLE do Horizon — RFC D2);
-> **nenhuma SVC tem implementação de verdade ainda**, isso é a G2.
+> Estado: **marco M4** (task G4) — janela GLFW + apresentação Vulkan (LWJGL 3) dos
+> framebuffers do guest, kernel Horizon em HLE (`svc`s + IPC + serviços `srv:`/`APT`/`hid`/
+> `fs`/`gsp` mínimo, G2/G3), sem interpretar ainda nenhuma lista de comando da PICA200 (isso é
+> a G5) — homebrew que desenha direto no framebuffer com a CPU (`consoleInit()` do libctru)
+> já aparece na tela.
 
 ## Arquitetura
 
@@ -57,8 +58,9 @@ prova que o preset `ARM11_MPCORE` executa ARMv6K real de forma consistente.
 
 ### Fora de escopo até aqui
 
-Nenhum serviço IPC (`srv:`/`APT`/`hid`/`fs`), nenhum gráfico (Vulkan é a G4), segundo núcleo,
-ARM9, MMU, áudio, ROMs comerciais (`.cia`/`.3ds`) — ver a RFC §5 para a lista completa.
+Nenhuma lista de comando da PICA200 interpretada (G5 — vertex shader interpretado + TEV→SPIR-V),
+segundo núcleo, ARM9, MMU, áudio (DSP, G7+), ROMs comerciais (`.cia`/`.3ds`, G6) — ver a RFC §5
+para a lista completa.
 
 ## Build
 
@@ -72,13 +74,48 @@ mvn test
 ## Uso
 
 ```sh
-n3dsemu [--interp|--check] [--slices=N] [--trace-svc] <arquivo.3dsx>
+n3dsemu [--headless] [--interp|--check] [--slices=N] [--trace-svc] [--script=<arquivo>] <arquivo.3dsx>
 ```
 
-Headless (sem gráfico — G1 não depende de LWJGL/Vulkan). Roda em fatias, capturando cada
-`svc` não implementada e seguindo em frente (o PC já avançou); ao esgotar `--slices` (ou
-parar de progredir por outro motivo), imprime o trace das últimas SVCs observadas e sai com
-código 3.
+**Janela é o default** (G4 — sem backend de software, RFC D4): abre uma janela GLFW com as
+duas telas do 3DS empilhadas verticalmente (superior 400×240 em cima, inferior 320×240
+centralizada embaixo) e roda até a janela fechar ou o guest travar/sair.
+
+`--headless` preserva o comportamento anterior (sem LWJGL/Vulkan, usado pelo CI e pelos
+testes automatizados — o runner do GitHub não tem GPU/driver Vulkan): roda em fatias,
+capturando cada `svc` não implementada e seguindo em frente (o PC já avançou); ao esgotar
+`--slices` (ou parar de progredir por outro motivo), imprime o trace das últimas SVCs
+observadas e sai com código 3.
+
+### Controles (mapeamento fixo, sem tela de configuração — G4)
+
+| Tecla | Botão |
+|-------|-------|
+| `Z` | A |
+| `X` | B |
+| `A` | Y |
+| `S` | X |
+| `Q` | L |
+| `W` | R |
+| `Enter` | START |
+| `Backspace` | SELECT |
+| Setas | D-Pad |
+| Mouse (botão esquerdo, sobre a tela inferior) | Touch screen |
+
+Círculo analógico ainda não mapeado neste marco (nenhum SVC deste corpus de teste depende
+dele — ver Aceite da G4).
+
+### macOS
+
+GLFW/Vulkan precisam iniciar na thread principal em macOS — rode a JVM com
+`-XstartOnFirstThread`. Não testado nesta máquina (Windows); registrado aqui por precaução
+para quando o CI ganhar um runner macOS.
+
+### Vulkan validation layers
+
+`-Dn3dsemu.vulkan.validation=true` liga as validation layers (`VK_LAYER_KHRONOS_validation`)
+se o SDK da LunarG estiver instalado — não é requisito de build (`lwjgl-shaderc` já traz o
+compilador de shaders embutido).
 
 ## Layout
 
@@ -87,8 +124,14 @@ src/main/java/dev/vitorsilverio/n3dsemu/
   loader/    Loader3dsx (.3dsx + relocação)
   memory/    mapa de endereçamento (RFC §3)
   core/      N3dsCp15 (TLS c13)
-  kernel/    SvcTable, nomes de SVC do Horizon
+  kernel/    SvcTable, nomes de SVC do Horizon, objetos do kernel (HandleTable, Scheduler...)
+  ipc/       codec de comando IPC (IpcRequest/IpcResponse)
+  service/   srv:/APT/hid/fs/gsp/cfg/ptm em HLE
+  input/     InputState, Keys, InputScript (--script)
+  gpu/       PicaRenderer, Screen/PixelFormat, FrameBufferCodec/FrameBufferState (G4)
+  gpu/vulkan/  VulkanRenderer (LWJGL 3 + GLFW, G4)
   N3dsMachine.java, Main.java
+src/main/resources/shaders/  present.vert/present.frag (compilados via lwjgl-shaderc em runtime)
 testdata/    corpus .3dsx/.elf compilado do devkitPro (ver testdata/README.md)
 ```
 

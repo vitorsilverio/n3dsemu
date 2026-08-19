@@ -18,6 +18,10 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
+      # G4: este runner não tem GPU/driver Vulkan. VulkanRendererSmokeTest captura a falha de
+      # inicialização (VulkanUnavailableException, incluindo LinkageError se libvulkan.so.1
+      # nem existir) e pula via Assumptions — os testes de gráfico "de verdade" rodam contra
+      # RecordingRenderer (RFC-N3DSEMU D4).
       - name: mvn test
         run: mvn --batch-mode --no-transfer-progress test
 

@@ -7,8 +7,10 @@ import dev.vitorsilverio.armjitter.core.ExclusiveMonitor;
 import dev.vitorsilverio.armjitter.decoder.InstructionSet;
 import dev.vitorsilverio.armjitter.jit.JitRuntime;
 import dev.vitorsilverio.armjitter.jit.JitRuntimeFactory;
+import dev.vitorsilverio.armjitter.memory.AddressSpace;
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.n3dsemu.core.N3dsCp15;
+import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
 import dev.vitorsilverio.n3dsemu.input.InputScript;
 import dev.vitorsilverio.n3dsemu.input.InputState;
 import dev.vitorsilverio.n3dsemu.kernel.HandleTable;
@@ -70,12 +72,17 @@ public final class N3dsMachine {
     private final JitRuntime runtime;
     private final SvcTable svcTable;
     private final InputState inputState;
+    private final AddressSpace memory;
+    private final GspGpuService gspGpuService;
 
-    private N3dsMachine(ArmCore core, JitRuntime runtime, SvcTable svcTable, InputState inputState) {
+    private N3dsMachine(ArmCore core, JitRuntime runtime, SvcTable svcTable, InputState inputState,
+                         AddressSpace memory, GspGpuService gspGpuService) {
         this.core = core;
         this.runtime = runtime;
         this.svcTable = svcTable;
         this.inputState = inputState;
+        this.memory = memory;
+        this.gspGpuService = gspGpuService;
     }
 
     /// Monta a máquina completa e posiciona o core no `entryPoint` de `image`, pronta para
@@ -147,7 +154,7 @@ public final class N3dsMachine {
         // Scheduler, nunca por manipulação direta do ArmCore.
         scheduler.attach(core, cp15, mainThread);
 
-        return new N3dsMachine(core, runtime, svcTable, inputState);
+        return new N3dsMachine(core, runtime, svcTable, inputState, memory, gspGpuService);
     }
 
     // ── injeção de input sem GUI (RFC-N3DSEMU G3) ───────────────────────────────────────────
@@ -187,6 +194,25 @@ public final class N3dsMachine {
 
     public SvcTable svcTable() {
         return svcTable;
+    }
+
+    /// Memória do guest — usada pelo laço de apresentação (`Main`, G4) para ler os bytes do
+    /// framebuffer ativo de cada tela (ver {@link #frameBufferState()}) antes de repassar a
+    /// {@link dev.vitorsilverio.n3dsemu.gpu.PicaRenderer#presentScreen}.
+    public AddressSpace memory() {
+        return memory;
+    }
+
+    /// Buffer ativo mais recente de cada tela (`GSPGPU_SetBufferSwap`, G4) — ver Javadoc de
+    /// {@link FrameBufferState}.
+    public FrameBufferState frameBufferState() {
+        return gspGpuService.frameBufferState();
+    }
+
+    /// Ver Javadoc de {@link GspGpuService#setVBlankListener} — o gancho que o laço de
+    /// apresentação (`Main`, G4) usa para saber quando ler os framebuffers e apresentar.
+    public void setVBlankListener(Runnable listener) {
+        gspGpuService.setVBlankListener(listener);
     }
 
     // Mesmo arredondamento de N3dsAddressSpace#buildExecutableImage (PagedAddressSpace exige

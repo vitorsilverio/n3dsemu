@@ -1,6 +1,9 @@
 package dev.vitorsilverio.n3dsemu.service;
 
 import dev.vitorsilverio.armjitter.memory.AddressSpace;
+import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
+import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
+import dev.vitorsilverio.n3dsemu.gpu.Screen;
 import dev.vitorsilverio.n3dsemu.kernel.EventObject;
 import dev.vitorsilverio.n3dsemu.kernel.HandleTable;
 import dev.vitorsilverio.n3dsemu.kernel.KernelObject;
@@ -96,14 +99,28 @@ public final class GspGpuService extends AbstractService {
     private static final int INTERRUPT_TYPE_PDC0_VBLANK_TOP = 2;
     private static final int U8_MASK = 0xFF;
 
+    /// `GSPGPU_SetBufferSwap(u8 screenId, GSPGPU_FramebufferInfo const* info)` — layout do IPC
+    /// (3dbrew: `GSPGPU:SetBufferSwap`, `GSP_Shared_Memory` para os campos da struct): palavra 0
+    /// = id da tela (0=`TOP`,1=`BOTTOM`), palavras 1-7 = `GSPGPU_FramebufferInfo` (28 bytes/7
+    /// palavras: `active_fb`, `left vaddr`, `right vaddr`, `stride`, `format`, `mode`/`status`,
+    /// `attribute` — só `left vaddr`/`stride`/`format` importam nesta HLE, RFC D6: sem 3D
+    /// estereoscópico, sempre o olho esquerdo).
+    private static final int SET_BUFFER_SWAP_SCREEN_ID = 0;
+    private static final int SET_BUFFER_SWAP_LEFT_VADDR = 2;
+    private static final int SET_BUFFER_SWAP_STRIDE = 4;
+    private static final int SET_BUFFER_SWAP_FORMAT = 5;
+    private static final int SCREEN_ID_TOP = 0;
+
     private final AddressSpace memory;
     private final HandleTable handles;
     private final Scheduler scheduler;
     private final HidService hidService;
+    private final FrameBufferState frameBufferState = new FrameBufferState();
     private final int gspSharedMemoryHandle;
 
     private EventObject interruptEvent;
     private long commandListsTriggered;
+    private Runnable vBlankListener;
 
     public GspGpuService(PrintStream log, AddressSpace memory, HandleTable handles, Scheduler scheduler,
                           HidService hidService) {
@@ -125,8 +142,9 @@ public final class GspGpuService extends AbstractService {
     @Override
     public void handleRequest(IpcRequest request, IpcResponse response) {
         switch (request.commandId()) {
-            case CMD_WRITE_HW_REGS, CMD_WRITE_HW_REGS_WITH_MASK, CMD_SET_BUFFER_SWAP,
+            case CMD_WRITE_HW_REGS, CMD_WRITE_HW_REGS_WITH_MASK,
                     CMD_FLUSH_DATA_CACHE, CMD_SET_LCD_FORCE_BLACK, CMD_ACQUIRE_RIGHT -> handleTrivialSuccess(request, response);
+            case CMD_SET_BUFFER_SWAP -> handleSetBufferSwap(request, response);
             case CMD_TRIGGER_CMD_REQ_QUEUE -> handleTriggerCmdReqQueue(request, response);
             case CMD_REGISTER_INTERRUPT_RELAY_QUEUE -> handleRegisterInterruptRelayQueue(request, response);
             default -> respondUnknown(request, response);
@@ -152,6 +170,20 @@ public final class GspGpuService extends AbstractService {
         response.translateHandles(gspSharedMemoryHandle);
     }
 
+    /// `GSPGPU_SetBufferSwap` — grava o buffer ATIVO da tela indicada em {@link #frameBufferState}
+    /// (endereço/stride/formato, sempre o olho esquerdo — ver Javadoc da constante do layout). É
+    /// isto que faz o laço de apresentação (`Main`, G4) saber onde ler o framebuffer do guest a
+    /// cada VBlank — sem isto a chamada era tratada como um sucesso trivial e o conteúdo era
+    /// descartado (comportamento herdado da G3, RFC/task: "descarta tudo").
+    private void handleSetBufferSwap(IpcRequest request, IpcResponse response) {
+        Screen screen = request.normalParam(SET_BUFFER_SWAP_SCREEN_ID) == SCREEN_ID_TOP ? Screen.TOP : Screen.BOTTOM;
+        int leftVaddr = request.normalParam(SET_BUFFER_SWAP_LEFT_VADDR);
+        int stride = request.normalParam(SET_BUFFER_SWAP_STRIDE);
+        PixelFormat format = PixelFormat.fromCode(request.normalParam(SET_BUFFER_SWAP_FORMAT));
+        frameBufferState.update(screen, leftVaddr, stride, format);
+        handleTrivialSuccess(request, response);
+    }
+
     private void handleTriggerCmdReqQueue(IpcRequest request, IpcResponse response) {
         commandListsTriggered++;
         handleTrivialSuccess(request, response);
@@ -175,6 +207,17 @@ public final class GspGpuService extends AbstractService {
             interruptEvent.signal();
         }
         hidService.advanceFrame();
+        if (vBlankListener != null) {
+            vBlankListener.run();
+        }
+    }
+
+    /// Registrado pelo laço de apresentação (`Main`, G4): chamado ao final de todo VBlank
+    /// simulado, depois que HID já atualizou — é o sinal que `Main` espera antes de ler os
+    /// framebuffers ativos e chamar {@link dev.vitorsilverio.n3dsemu.gpu.PicaRenderer#presentScreen}
+    /// (RFC/task: "`runSlice()` até o `gsp` sinalizar VBlank").
+    public void setVBlankListener(Runnable listener) {
+        this.vBlankListener = listener;
     }
 
     /// Escreve uma entrada na fila circular de interrupções (3dbrew: GSP Shared Memory) e avança
@@ -204,5 +247,11 @@ public final class GspGpuService extends AbstractService {
     /// conteúdo da lista nunca é interpretado nesta task, RFC/task: "guardadas e contadas").
     public long commandListsTriggered() {
         return commandListsTriggered;
+    }
+
+    /// Buffers ativos mais recentes (uma entrada por {@link Screen} depois do primeiro
+    /// `SetBufferSwap`) — lido pelo laço de apresentação (`Main`, G4) a cada VBlank.
+    public FrameBufferState frameBufferState() {
+        return frameBufferState;
     }
 }
