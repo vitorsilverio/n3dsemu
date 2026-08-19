@@ -788,11 +788,20 @@ public final class VulkanRenderer implements PicaRenderer {
                     .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     .imageView(texture.imageView)
                     .sampler(sampler);
+            // G4.2, achado real: sem descriptorCount(1) explícito a struct calloc'd fica com
+            // count=0 — vkUpdateDescriptorSets vira um no-op silencioso (sem erro de API) e o
+            // descriptor set nunca é escrito de verdade. As validation layers só acusam isso no
+            // vkCmdDraw seguinte ("descriptor... never been updated"), não na própria chamada de
+            // update — por isso passava despercebido sem `-Dn3dsemu.vulkan.validation=true`. Era
+            // a causa raiz real da janela ficar 100% preta mesmo com o framebuffer do guest e o
+            // upload de textura corretos (confirmado por instrumentação: milhares de
+            // uploadPending/renderFrame reais antes do fix, ainda preto).
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack)
                     .sType(VK10.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
                     .dstSet(texture.descriptorSet)
                     .dstBinding(0)
                     .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1)
                     .pImageInfo(imageInfo);
             vkUpdateDescriptorSets(device, write, null);
         }
