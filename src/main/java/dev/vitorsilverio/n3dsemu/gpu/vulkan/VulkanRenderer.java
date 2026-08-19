@@ -4,6 +4,7 @@ import dev.vitorsilverio.n3dsemu.gpu.FrameBufferCodec;
 import dev.vitorsilverio.n3dsemu.gpu.PicaRenderer;
 import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
 import dev.vitorsilverio.n3dsemu.gpu.Screen;
+import dev.vitorsilverio.n3dsemu.gpu.ShadedVertex;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -15,7 +16,9 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
+import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.lwjgl.glfw.GLFW.*;
@@ -52,6 +55,9 @@ public final class VulkanRenderer implements PicaRenderer {
     /// `push_constant` de `present.vert`: `vec4 rect` (16 bytes).
     private static final int PUSH_CONSTANT_SIZE_BYTES = 16;
 
+    /// `vec2` posição NDC + `vec4` cor (RFC G5/PR2) — ver `shaders/triangle.vert`.
+    private static final int GEOMETRY_VERTEX_STRIDE_BYTES = 6 * Float.BYTES;
+
     private final long window;
     private final VkInstance instance;
     private final long surface;
@@ -66,6 +72,14 @@ public final class VulkanRenderer implements PicaRenderer {
     private final long pipelineLayout;
     private final long renderPass;
     private final long sampler;
+
+    /// Pipeline de geometria (RFC G5/PR2): desenha triângulos já sombreados (posição NDC + cor
+    /// por vértice, sem textura) DIRETO na {@link ScreenTexture#image} de destino — reaproveita
+    /// 100% do caminho de apresentação/rotação já validado na G4 (a MESMA textura que o *blit* da
+    /// CPU alimenta), em vez de inventar um caminho paisagem paralelo. Ainda **sem TEV** (PR3).
+    private final long geometryRenderPass;
+    private final long geometryPipelineLayout;
+    private final long geometryPipeline;
 
     private long swapchain;
     private int swapchainImageFormat;
@@ -82,12 +96,19 @@ public final class VulkanRenderer implements PicaRenderer {
     private int currentFrame;
 
     private final Map<Screen, ScreenTexture> textures = new EnumMap<>(Screen.class);
+    private final Map<Screen, List<ShadedVertex>> pendingTriangles = new EnumMap<>(Screen.class);
+    /// Recursos (ex.: *vertex buffers* descartáveis de {@link #drawPendingTriangles}) só podem
+    /// ser liberados depois que a GPU terminar de usá-los — um balde por *frame in flight*,
+    /// esvaziado logo após {@code vkWaitForFences} confirmar que aquele *slot* está livre de
+    /// novo (RFC G5/PR2, "sem otimização": um `vkDestroyBuffer` por desenho é aceitável aqui).
+    private final List<Runnable>[] frameCleanup;
     private boolean framebufferResized;
     private boolean closed;
 
     /// Recursos de uma tela: textura RETRATO (largura=`Screen.ROWS`, altura=`screen.columns()` —
     /// a rotação é feita no shader, nunca aqui) + buffer de staging persistente (mapeado uma vez)
-    /// para o upload de {@link #presentScreen}.
+    /// para o upload de {@link #presentScreen} + um framebuffer próprio (`geometryFramebuffer`)
+    /// para {@link #geometryRenderPass} desenhar geometria direto nesta MESMA imagem (RFC G5/PR2).
     private final class ScreenTexture {
         final int width;
         final int height;
@@ -100,6 +121,7 @@ public final class VulkanRenderer implements PicaRenderer {
         ByteBuffer stagingMapped;
         boolean everUploaded;
         byte[] pendingRgba8;
+        long geometryFramebuffer;
 
         ScreenTexture(int width, int height) {
             this.width = width;
@@ -143,12 +165,16 @@ public final class VulkanRenderer implements PicaRenderer {
             this.pipelineLayout = createPipelineLayout();
             this.renderPass = createRenderPass();
             this.sampler = createSampler();
+            this.geometryRenderPass = createGeometryRenderPass();
+            this.geometryPipelineLayout = createGeometryPipelineLayout();
             createSwapchainAndDependents();
             createCommandBuffers();
             createSyncObjects();
             for (Screen screen : Screen.values()) {
                 textures.put(screen, createScreenTexture(screen));
             }
+            this.geometryPipeline = createGeometryPipeline();
+            this.frameCleanup = newFrameCleanupArray();
         } catch (VulkanUnavailableException e) {
             throw e;
         } catch (LinkageError | RuntimeException e) {
@@ -178,6 +204,11 @@ public final class VulkanRenderer implements PicaRenderer {
     // ── PicaRenderer ────────────────────────────────────────────────────────────────────────
 
     @Override
+    public void drawTriangles(Screen screen, List<ShadedVertex> vertices) {
+        pendingTriangles.put(screen, List.copyOf(vertices));
+    }
+
+    @Override
     public void presentScreen(Screen screen, byte[] pixels, PixelFormat format, int stride) {
         textures.get(screen).pendingRgba8 = FrameBufferCodec.decodeToRgba8(pixels, screen, format, stride);
     }
@@ -194,7 +225,11 @@ public final class VulkanRenderer implements PicaRenderer {
         }
         closed = true;
         vkDeviceWaitIdle(device);
+        for (List<Runnable> cleanup : frameCleanup) {
+            runAndClear(cleanup);
+        }
         for (ScreenTexture texture : textures.values()) {
+            vkDestroyFramebuffer(device, texture.geometryFramebuffer, null);
             vkDestroyImageView(device, texture.imageView, null);
             vkDestroyImage(device, texture.image, null);
             vkFreeMemory(device, texture.imageMemory, null);
@@ -204,6 +239,9 @@ public final class VulkanRenderer implements PicaRenderer {
             vkDestroyBuffer(device, texture.stagingBuffer, null);
             vkFreeMemory(device, texture.stagingMemory, null);
         }
+        vkDestroyPipeline(device, geometryPipeline, null);
+        vkDestroyPipelineLayout(device, geometryPipelineLayout, null);
+        vkDestroyRenderPass(device, geometryRenderPass, null);
         vkDestroySampler(device, sampler, null);
         destroySwapchainAndDependents();
         for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
@@ -503,6 +541,234 @@ public final class VulkanRenderer implements PicaRenderer {
         }
     }
 
+    // ── geometria (RFC G5/PR2) ──────────────────────────────────────────────────────────────
+
+    /// *Render pass* dedicado à geometria: mesmo formato de {@link ScreenTexture#image}
+    /// (`VK_FORMAT_R8G8B8A8_UNORM`), mas layout final `SHADER_READ_ONLY_OPTIMAL` (a imagem volta
+    /// a ser lida pelo pipeline de apresentação da G4 logo em seguida, mesma textura).
+    /// `LOAD_OP_CLEAR`: nesta PR geometria e *blit* de CPU não coexistem no mesmo quadro (sem
+    /// consumidor real que precise dos dois juntos ainda).
+    private long createGeometryRenderPass() {
+        try (MemoryStack stack = stackPush()) {
+            VkAttachmentDescription.Buffer attachment = VkAttachmentDescription.calloc(1, stack)
+                    .format(VK_FORMAT_R8G8B8A8_UNORM)
+                    .samples(VK_SAMPLE_COUNT_1_BIT)
+                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE)
+                    .stencilLoadOp(VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+                    .stencilStoreOp(VK_ATTACHMENT_STORE_OP_DONT_CARE)
+                    .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                    .finalLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+            VkAttachmentReference.Buffer colorRef = VkAttachmentReference.calloc(1, stack)
+                    .attachment(0)
+                    .layout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+            VkSubpassDescription.Buffer subpass = VkSubpassDescription.calloc(1, stack)
+                    .pipelineBindPoint(VK_PIPELINE_BIND_POINT_GRAPHICS)
+                    .colorAttachmentCount(1)
+                    .pColorAttachments(colorRef);
+
+            VkSubpassDependency.Buffer dependency = VkSubpassDependency.calloc(1, stack)
+                    .srcSubpass(VK_SUBPASS_EXTERNAL)
+                    .dstSubpass(0)
+                    .srcStageMask(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+                    .srcAccessMask(0)
+                    .dstStageMask(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
+                    .dstAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+
+            VkRenderPassCreateInfo createInfo = VkRenderPassCreateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO)
+                    .pAttachments(attachment)
+                    .pSubpasses(subpass)
+                    .pDependencies(dependency);
+
+            LongBuffer pRenderPass = stack.mallocLong(1);
+            check(vkCreateRenderPass(device, createInfo, null, pRenderPass), "vkCreateRenderPass (geometria)");
+            return pRenderPass.get(0);
+        }
+    }
+
+    private long createGeometryPipelineLayout() {
+        try (MemoryStack stack = stackPush()) {
+            VkPipelineLayoutCreateInfo createInfo = VkPipelineLayoutCreateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+            LongBuffer pLayout = stack.mallocLong(1);
+            check(vkCreatePipelineLayout(device, createInfo, null, pLayout), "vkCreatePipelineLayout (geometria)");
+            return pLayout.get(0);
+        }
+    }
+
+    private long createGeometryFramebuffer(ScreenTexture texture) {
+        try (MemoryStack stack = stackPush()) {
+            VkFramebufferCreateInfo framebufferInfo = VkFramebufferCreateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
+                    .renderPass(geometryRenderPass)
+                    .pAttachments(stack.longs(texture.imageView))
+                    .width(texture.width)
+                    .height(texture.height)
+                    .layers(1);
+            LongBuffer pFramebuffer = stack.mallocLong(1);
+            check(vkCreateFramebuffer(device, framebufferInfo, null, pFramebuffer), "vkCreateFramebuffer (geometria)");
+            return pFramebuffer.get(0);
+        }
+    }
+
+    /// Vértice: `vec2` posição já em NDC (divisão de perspectiva feita em Java, RFC G5/PR2) +
+    /// `vec4` cor — sem textura/TEV (PR3). *Viewport*/*scissor* **dinâmicos** (`vkCmdSetViewport`/
+    /// `vkCmdSetScissor`): TOP e BOTTOM têm dimensões de textura diferentes, um pipeline serve as
+    /// duas.
+    private long createGeometryPipeline() {
+        try (MemoryStack stack = stackPush()) {
+            long vertModule = createShaderModule("shaders/triangle.vert", Shaderc.shaderc_glsl_vertex_shader, stack);
+            long fragModule = createShaderModule("shaders/triangle.frag", Shaderc.shaderc_glsl_fragment_shader, stack);
+            try {
+                VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
+                stages.get(0)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+                        .stage(VK_SHADER_STAGE_VERTEX_BIT)
+                        .module(vertModule)
+                        .pName(stack.UTF8("main"));
+                stages.get(1)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+                        .stage(VK_SHADER_STAGE_FRAGMENT_BIT)
+                        .module(fragModule)
+                        .pName(stack.UTF8("main"));
+
+                VkVertexInputBindingDescription.Buffer binding = VkVertexInputBindingDescription.calloc(1, stack)
+                        .binding(0)
+                        .stride(GEOMETRY_VERTEX_STRIDE_BYTES)
+                        .inputRate(VK_VERTEX_INPUT_RATE_VERTEX);
+                VkVertexInputAttributeDescription.Buffer attributes = VkVertexInputAttributeDescription.calloc(2, stack);
+                attributes.get(0).binding(0).location(0).format(VK_FORMAT_R32G32_SFLOAT).offset(0);
+                attributes.get(1).binding(0).location(1).format(VK_FORMAT_R32G32B32A32_SFLOAT).offset(8);
+                VkPipelineVertexInputStateCreateInfo vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO)
+                        .pVertexBindingDescriptions(binding)
+                        .pVertexAttributeDescriptions(attributes);
+
+                VkPipelineInputAssemblyStateCreateInfo inputAssembly = VkPipelineInputAssemblyStateCreateInfo.calloc(stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO)
+                        .topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+
+                VkPipelineViewportStateCreateInfo viewportState = VkPipelineViewportStateCreateInfo.calloc(stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO)
+                        .viewportCount(1)
+                        .scissorCount(1);
+
+                VkPipelineDynamicStateCreateInfo dynamicState = VkPipelineDynamicStateCreateInfo.calloc(stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO)
+                        .pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR));
+
+                VkPipelineRasterizationStateCreateInfo rasterizer = VkPipelineRasterizationStateCreateInfo.calloc(stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
+                        .polygonMode(VK_POLYGON_MODE_FILL)
+                        .cullMode(VK_CULL_MODE_NONE)
+                        .frontFace(VK_FRONT_FACE_CLOCKWISE)
+                        .lineWidth(1f);
+
+                VkPipelineMultisampleStateCreateInfo multisample = VkPipelineMultisampleStateCreateInfo.calloc(stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
+                        .rasterizationSamples(VK_SAMPLE_COUNT_1_BIT);
+
+                VkPipelineColorBlendAttachmentState.Buffer blendAttachment = VkPipelineColorBlendAttachmentState.calloc(1, stack)
+                        .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                                | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
+                        .blendEnable(false);
+                VkPipelineColorBlendStateCreateInfo colorBlend = VkPipelineColorBlendStateCreateInfo.calloc(stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO)
+                        .pAttachments(blendAttachment);
+
+                VkGraphicsPipelineCreateInfo.Buffer pipelineInfo = VkGraphicsPipelineCreateInfo.calloc(1, stack);
+                pipelineInfo.get(0)
+                        .sType(VK10.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
+                        .pStages(stages)
+                        .pVertexInputState(vertexInput)
+                        .pInputAssemblyState(inputAssembly)
+                        .pViewportState(viewportState)
+                        .pDynamicState(dynamicState)
+                        .pRasterizationState(rasterizer)
+                        .pMultisampleState(multisample)
+                        .pColorBlendState(colorBlend)
+                        .layout(geometryPipelineLayout)
+                        .renderPass(geometryRenderPass)
+                        .subpass(0);
+
+                LongBuffer pPipeline = stack.mallocLong(1);
+                check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, pipelineInfo, null, pPipeline),
+                        "vkCreateGraphicsPipelines (geometria)");
+                return pPipeline.get(0);
+            } finally {
+                vkDestroyShaderModule(device, vertModule, null);
+                vkDestroyShaderModule(device, fragModule, null);
+            }
+        }
+    }
+
+    private void drawPendingTriangles(VkCommandBuffer commandBuffer, MemoryStack stack) {
+        for (Map.Entry<Screen, List<ShadedVertex>> entry : pendingTriangles.entrySet()) {
+            ScreenTexture texture = textures.get(entry.getKey());
+            List<ShadedVertex> vertices = entry.getValue();
+            if (vertices.isEmpty()) {
+                continue;
+            }
+
+            long[] vertexBufferAndMemory = uploadGeometryVertexBuffer(vertices, stack);
+            long vertexBuffer = vertexBufferAndMemory[0];
+            long vertexBufferMemory = vertexBufferAndMemory[1];
+
+            VkClearValue.Buffer clearValues = VkClearValue.calloc(1, stack);
+            clearValues.get(0).color().float32(0, 0f).float32(1, 0f).float32(2, 0f).float32(3, 1f);
+            VkRenderPassBeginInfo renderPassInfo = VkRenderPassBeginInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
+                    .renderPass(geometryRenderPass)
+                    .framebuffer(texture.geometryFramebuffer)
+                    .pClearValues(clearValues);
+            renderPassInfo.renderArea().offset().set(0, 0);
+            renderPassInfo.renderArea().extent().set(texture.width, texture.height);
+
+            vkCmdBeginRenderPass(commandBuffer, renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, geometryPipeline);
+
+            VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
+                    .x(0).y(0).width(texture.width).height(texture.height).minDepth(0f).maxDepth(1f);
+            vkCmdSetViewport(commandBuffer, 0, viewport);
+            VkRect2D.Buffer scissor = VkRect2D.calloc(1, stack);
+            scissor.get(0).offset().set(0, 0);
+            scissor.get(0).extent().set(texture.width, texture.height);
+            vkCmdSetScissor(commandBuffer, 0, scissor);
+
+            vkCmdBindVertexBuffers(commandBuffer, 0, stack.longs(vertexBuffer), stack.longs(0));
+            vkCmdDraw(commandBuffer, vertices.size(), 1, 0, 0);
+            vkCmdEndRenderPass(commandBuffer);
+
+            // Buffer host-visible descartável por desenho (RFC/task G5, "Não inclui": "sem
+            // otimização de desempenho — correção primeiro"); liberado só depois que a fila
+            // terminar de usá-lo, senão o driver pode ler memória já desalocada.
+            frameCleanup[currentFrame].add(() -> {
+                vkDestroyBuffer(device, vertexBuffer, null);
+                vkFreeMemory(device, vertexBufferMemory, null);
+            });
+            texture.everUploaded = true;
+        }
+        pendingTriangles.clear();
+    }
+
+    private long[] uploadGeometryVertexBuffer(List<ShadedVertex> vertices, MemoryStack stack) {
+        long sizeBytes = (long) vertices.size() * GEOMETRY_VERTEX_STRIDE_BYTES;
+        long[] bufferAndMemory = createBuffer(sizeBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        PointerBuffer pData = stack.mallocPointer(1);
+        check(vkMapMemory(device, bufferAndMemory[1], 0, sizeBytes, 0, pData), "vkMapMemory (vertex buffer)");
+        ByteBuffer mapped = pData.getByteBuffer(0, (int) sizeBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (ShadedVertex v : vertices) {
+            mapped.putFloat(v.ndcX()).putFloat(v.ndcY())
+                    .putFloat(v.r()).putFloat(v.g()).putFloat(v.b()).putFloat(v.a());
+        }
+        vkUnmapMemory(device, bufferAndMemory[1]);
+        return bufferAndMemory;
+    }
+
     private int chooseSurfaceFormat(MemoryStack stack) {
         IntBuffer count = stack.mallocInt(1);
         vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, count, null);
@@ -761,11 +1027,12 @@ public final class VulkanRenderer implements PicaRenderer {
         try (MemoryStack stack = stackPush()) {
             long[] imageAndMemory = createImage(texture.width, texture.height, VK_FORMAT_R8G8B8A8_UNORM,
                     VK_IMAGE_TILING_OPTIMAL,
-                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             texture.image = imageAndMemory[0];
             texture.imageMemory = imageAndMemory[1];
             texture.imageView = createImageView(texture.image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+            texture.geometryFramebuffer = createGeometryFramebuffer(texture);
 
             long sizeBytes = (long) texture.width * texture.height * 4;
             long[] bufferAndMemory = createBuffer(sizeBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -936,6 +1203,7 @@ public final class VulkanRenderer implements PicaRenderer {
     private void renderFrame() {
         try (MemoryStack stack = stackPush()) {
             vkWaitForFences(device, inFlightFences[currentFrame], true, Long.MAX_VALUE);
+            runAndClear(frameCleanup[currentFrame]);
 
             IntBuffer pImageIndex = stack.mallocInt(1);
             int acquireResult = vkAcquireNextImageKHR(device, swapchain, Long.MAX_VALUE,
@@ -991,6 +1259,7 @@ public final class VulkanRenderer implements PicaRenderer {
                 uploadPending(commandBuffer, texture, stack);
             }
         }
+        drawPendingTriangles(commandBuffer, stack);
 
         VkClearValue.Buffer clearValues = VkClearValue.calloc(1, stack);
         clearValues.get(0).color().float32(0, 0f).float32(1, 0f).float32(2, 0f).float32(3, 1f);
@@ -1084,6 +1353,22 @@ public final class VulkanRenderer implements PicaRenderer {
             throw new IllegalStateException("transição de layout não suportada: " + oldLayout + " -> " + newLayout);
         }
         vkCmdPipelineBarrier(commandBuffer, srcStage, dstStage, 0, null, null, barrier);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Runnable>[] newFrameCleanupArray() {
+        List<Runnable>[] array = new List[FRAMES_IN_FLIGHT];
+        for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+            array[i] = new ArrayList<>();
+        }
+        return array;
+    }
+
+    private static void runAndClear(List<Runnable> tasks) {
+        for (Runnable task : tasks) {
+            task.run();
+        }
+        tasks.clear();
     }
 
     private static void check(int result, String operation) {

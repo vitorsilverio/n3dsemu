@@ -10,8 +10,20 @@ import java.util.Map;
 /// {@link FrameBufferCodec}) sem olho humano nem driver Vulkan.
 public final class RecordingRenderer implements PicaRenderer {
     private final Map<Screen, byte[]> lastRgba8 = new EnumMap<>(Screen.class);
+    private final Map<Screen, java.util.List<ShadedVertex>> lastTriangles = new EnumMap<>(Screen.class);
     private int frameCount;
     private boolean closed;
+
+    @Override
+    public void drawTriangles(Screen screen, java.util.List<ShadedVertex> vertices) {
+        lastTriangles.put(screen, java.util.List.copyOf(vertices));
+    }
+
+    /// Última lista de triângulos recebida para `screen` (RFC G5/PR2), ou `null` se
+    /// {@link #drawTriangles} nunca foi chamado para essa tela.
+    public java.util.List<ShadedVertex> lastTriangles(Screen screen) {
+        return lastTriangles.get(screen);
+    }
 
     @Override
     public void presentScreen(Screen screen, byte[] pixels, PixelFormat format, int stride) {

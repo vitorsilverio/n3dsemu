@@ -29,6 +29,18 @@ make
 O `.elf` é mantido junto do `.3dsx` para depuração simbólica (mesmo padrão do
 `nds-examples` do ndsemu — ver memória `ndsemu-homebrew-testing`).
 
+## `shaders/`
+
+`shaders/simple_tri.shbin` — vertex shader do exemplo `simple_tri` (G5/D5: fixture real para
+`ShaderBinaryTest`/`VertexShaderInterpreterTest`, sem depender de GPU). Compilado direto do
+Windows (não precisa da dança MSYS2 abaixo — `picasso.exe` é uma ferramenta standalone, não
+passa por `arm-none-eabi-gcc`):
+
+```
+C:\devkitPro\tools\bin\picasso.exe -o testdata\shaders\simple_tri.shbin ^
+    C:\devkitPro\examples\3ds\graphics\gpu\simple_tri\source\vshader.v.pica
+```
+
 ## Armadilha de ambiente (Windows)
 
 Este ambiente tem **duas instalações MSYS2 independentes** (a do Git for Windows, usada pelo

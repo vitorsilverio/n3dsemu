@@ -10,6 +10,14 @@ package dev.vitorsilverio.n3dsemu.gpu;
 /// aceite automatizado 'o triângulo apareceu'") — a validação é visual, pelo usuário.
 public interface PicaRenderer {
 
+    /// Desenha uma lista de triângulos já sombreados (RFC-N3DSEMU G5/PR2: saída do vertex shader
+    /// interpretado, já com a divisão de perspectiva aplicada — ver {@link ShadedVertex}) na
+    /// tela indicada. `vertices.size()` é múltiplo de 3 (lista de triângulos — sem *strip*/*fan*
+    /// nesta PR, formato de primitiva mais comum e o único que o marco M5 usa). **Ainda sem
+    /// TEV/texturas (PR3)**: a cor final é só a cor interpolada do vértice, sem combinador de
+    /// nenhum estágio.
+    void drawTriangles(Screen screen, java.util.List<ShadedVertex> vertices);
+
     /// Entrega o conteúdo de uma tela para apresentação.
     ///
     /// `pixels` está no formato e na orientação do 3DS (varredura por coluna, origem no canto
