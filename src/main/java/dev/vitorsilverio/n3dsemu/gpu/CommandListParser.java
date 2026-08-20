@@ -31,6 +31,14 @@ public final class CommandListParser {
     /// sobrando ao final (menos de 2, ou menos que a contagem de palavras extras do último
     /// cabeçalho) são ignoradas — mesmo comportamento de uma lista real preenchida com padding.
     public static void parse(int[] words, PicaRegisters registers) {
+        parse(words, registers, RegisterWriteListener.NONE);
+    }
+
+    /// Como {@link #parse(int[], PicaRegisters)}, mas notifica `listener` a CADA escrita
+    /// individual, na ordem em que acontecem (RFC-N3DSEMU G5/PR3) — necessário para os
+    /// registradores-FIFO do upload de shader, onde o valor final guardado em `registers` não
+    /// basta (ver Javadoc de {@link RegisterWriteListener}).
+    public static void parse(int[] words, PicaRegisters registers, RegisterWriteListener listener) {
         int i = 0;
         while (i + 1 < words.length) {
             int parameter = words[i];
@@ -43,9 +51,11 @@ public final class CommandListParser {
             boolean consecutive = (header & CONSECUTIVE_BIT) != 0;
 
             registers.write(registerId, parameter, byteMask);
+            listener.onWrite(registerId, parameter, byteMask);
             for (int extra = 0; extra < extraCount && i < words.length; extra++, i++) {
                 int targetRegisterId = consecutive ? registerId + 1 + extra : registerId;
                 registers.write(targetRegisterId, words[i], byteMask);
+                listener.onWrite(targetRegisterId, words[i], byteMask);
             }
         }
     }

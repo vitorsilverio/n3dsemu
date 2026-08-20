@@ -115,19 +115,27 @@ public final class Main {
             return;
         }
 
-        N3dsMachine machine = N3dsMachine.create(image, backend, System.out, traceSvc, inputScript);
         if (headless) {
+            // RFC-N3DSEMU G5/PR3: sem renderer real (`null`) — o headless/CI não tem GPU/driver
+            // Vulkan (RFC D4), a GPU continua sendo interpretada/contada mas nada é desenhado,
+            // mesmo comportamento de antes desta PR.
+            N3dsMachine machine = N3dsMachine.create(image, backend, System.out, traceSvc, inputScript, null);
             runHeadless(machine, sliceCount);
         } else {
-            runWindowed(machine);
+            runWindowed(image, backend, traceSvc, inputScript);
         }
     }
 
     /// Modo padrão (RFC-N3DSEMU G4): janela GLFW + apresentação Vulkan. Laço de emulação e de
     /// render na MESMA thread (RFC/task: "simples e determinístico") — roda até o guest
-    /// encerrar/travar ou a janela fechar.
-    private static void runWindowed(N3dsMachine machine) {
+    /// encerrar/travar ou a janela fechar. O `VulkanRenderer` é criado ANTES de `N3dsMachine`
+    /// (RFC-N3DSEMU G5/PR3) porque `gsp::Gpu` agora recebe o `PicaRenderer` real no construtor —
+    /// é isto que faz uma lista de comandos GX real (`GX_ProcessCommandList`) desenhar de verdade
+    /// na janela, e não só aplicar/contar registradores (ver Javadoc de `GspGpuService`).
+    private static void runWindowed(Image3dsx image, N3dsMachine.Backend backend, boolean traceSvc,
+                                     InputScript inputScript) {
         VulkanRenderer renderer = new VulkanRenderer();
+        N3dsMachine machine = N3dsMachine.create(image, backend, System.out, traceSvc, inputScript, renderer);
         AtomicBoolean vblank = new AtomicBoolean(false);
         machine.setVBlankListener(() -> vblank.set(true));
         glfwSetKeyCallback(renderer.windowHandle(), (window, key, scancode, action, mods) -> {

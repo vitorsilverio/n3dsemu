@@ -11,6 +11,7 @@ import dev.vitorsilverio.armjitter.memory.AddressSpace;
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.n3dsemu.core.N3dsCp15;
 import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
+import dev.vitorsilverio.n3dsemu.gpu.PicaRenderer;
 import dev.vitorsilverio.n3dsemu.input.InputScript;
 import dev.vitorsilverio.n3dsemu.input.InputState;
 import dev.vitorsilverio.n3dsemu.kernel.HandleTable;
@@ -102,6 +103,15 @@ public final class N3dsMachine {
     /// VBlank simulado por {@link HidService#advanceFrame}.
     public static N3dsMachine create(Image3dsx image, Backend backend, PrintStream diagnosticLog, boolean traceSvc,
                                       InputScript inputScript) {
+        return create(image, backend, diagnosticLog, traceSvc, inputScript, null);
+    }
+
+    /// Como a sobrecarga acima, mas com um {@link PicaRenderer} real (RFC-N3DSEMU G5/PR3) — sem
+    /// ele, `gsp::Gpu` aplica/conta os registradores da GPU mas não desenha nada (mesmo
+    /// comportamento de antes desta PR, usado pelo `--headless`/testes). `Main` (modo janela)
+    /// passa o {@code VulkanRenderer} real aqui; é isto que faz `simple_tri` desenhar de verdade.
+    public static N3dsMachine create(Image3dsx image, Backend backend, PrintStream diagnosticLog, boolean traceSvc,
+                                      InputScript inputScript, PicaRenderer renderer) {
         PagedAddressSpace memory = N3dsAddressSpace.create(image, diagnosticLog);
 
         // B5.2: ARMv6K + VFPv2, sem Thumb-2 (o MPCore do 3DS é ARMv6K, não ARMv6T2).
@@ -129,7 +139,7 @@ public final class N3dsMachine {
         InputState inputState = new InputState();
         ServiceRegistry serviceRegistry = new ServiceRegistry();
         HidService hidService = new HidService(diagnosticLog, memory, handles, inputState, inputScript);
-        GspGpuService gspGpuService = new GspGpuService(diagnosticLog, memory, handles, scheduler, hidService);
+        GspGpuService gspGpuService = new GspGpuService(diagnosticLog, memory, handles, scheduler, hidService, renderer);
         serviceRegistry.register(new SrvService(diagnosticLog, handles, serviceRegistry));
         AptService aptService = new AptService(diagnosticLog, handles);
         serviceRegistry.register(aptService);

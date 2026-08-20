@@ -1,9 +1,15 @@
 package dev.vitorsilverio.n3dsemu.service;
 
 import dev.vitorsilverio.armjitter.memory.AddressSpace;
+import dev.vitorsilverio.n3dsemu.gpu.CommandListParser;
 import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
+import dev.vitorsilverio.n3dsemu.gpu.GxCommandQueue;
+import dev.vitorsilverio.n3dsemu.gpu.PicaRegisters;
+import dev.vitorsilverio.n3dsemu.gpu.PicaRenderer;
 import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
 import dev.vitorsilverio.n3dsemu.gpu.Screen;
+import dev.vitorsilverio.n3dsemu.gpu.VertexPipeline;
+import dev.vitorsilverio.n3dsemu.gpu.shader.ShaderUpload;
 import dev.vitorsilverio.n3dsemu.kernel.EventObject;
 import dev.vitorsilverio.n3dsemu.kernel.HandleTable;
 import dev.vitorsilverio.n3dsemu.kernel.KernelObject;
@@ -16,6 +22,7 @@ import dev.vitorsilverio.n3dsemu.ipc.IpcResponse;
 import dev.vitorsilverio.n3dsemu.memory.MemoryMap;
 
 import java.io.PrintStream;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -130,6 +137,11 @@ public final class GspGpuService extends AbstractService {
     private static final int SET_BUFFER_SWAP_FORMAT = 5;
     private static final int SCREEN_ID_TOP = 0;
 
+    /// Base da fila de comandos GX (`gxCmdQueue_s`) do cliente 0 dentro da memória compartilhada
+    /// (3dbrew: GSP Shared Memory, "Command buffer header" — `sharedMemBase + 0x800 +
+    /// clientID*0x200`; só o cliente 0 nesta HLE, RFC D1, ver Javadoc de {@link GxCommandQueue}).
+    private static final int GX_COMMAND_QUEUE_OFFSET = 0x800;
+
     private final AddressSpace memory;
     private final HandleTable handles;
     private final Scheduler scheduler;
@@ -137,17 +149,42 @@ public final class GspGpuService extends AbstractService {
     private final FrameBufferState frameBufferState = new FrameBufferState();
     private final int gspSharedMemoryHandle;
 
+    /// Banco de registradores internos da PICA200 (RFC-N3DSEMU G5/PR3) — persistente pela vida
+    /// deste serviço, exatamente como o hardware real: uma lista de comandos só programa os
+    /// registradores que muda, o resto sobrevive de quadro em quadro.
+    private final PicaRegisters gpuRegisters = new PicaRegisters();
+    /// Captura o upload de vertex shader por registrador-FIFO da ÚLTIMA lista processada (ver
+    /// Javadoc de {@link ShaderUpload}) — como {@link #gpuRegisters}, sobrevive entre listas
+    /// (RFC/task: um app típico faz upload do shader uma vez e desenha em vários quadros depois).
+    private final ShaderUpload shaderUpload = new ShaderUpload();
+    /// Destino real do desenho (RFC-N3DSEMU G5/PR3) — `null` no modo `--headless`/testes que não
+    /// precisam de saída gráfica (RFC/task G3: comportamento herdado, "descarta tudo" quando não
+    /// há para onde desenhar).
+    private final PicaRenderer renderer;
+
     private EventObject interruptEvent;
     private long commandListsTriggered;
     private Runnable vBlankListener;
 
     public GspGpuService(PrintStream log, AddressSpace memory, HandleTable handles, Scheduler scheduler,
                           HidService hidService) {
+        this(log, memory, handles, scheduler, hidService, null);
+    }
+
+    /// Como o construtor de 5 argumentos, mas com um {@link PicaRenderer} real (RFC-N3DSEMU
+    /// G5/PR3) — `renderer` recebe os triângulos desenhados de verdade quando uma lista de
+    /// comandos GX (`GX_ProcessCommandList`) dispara `DrawArrays`/`DrawElements` (ver
+    /// {@link #handleCommandListWords}). `null` preserva o comportamento anterior (registradores
+    /// aplicados/contados, nada desenhado) — usado pelo modo `--headless` e pelos testes que não
+    /// sobem uma janela/GPU.
+    public GspGpuService(PrintStream log, AddressSpace memory, HandleTable handles, Scheduler scheduler,
+                          HidService hidService, PicaRenderer renderer) {
         super(log);
         this.memory = Objects.requireNonNull(memory, "memory");
         this.handles = Objects.requireNonNull(handles, "handles");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         this.hidService = Objects.requireNonNull(hidService, "hidService");
+        this.renderer = renderer;
         this.gspSharedMemoryHandle = handles.create(
                 MemoryBlockObject.serverOwned(GSP_SHARED_MEMORY_SIZE, MemoryPermission.READ_WRITE, MemoryPermission.READ));
         scheduler.registerPeriodicPulse(TICKS_PER_FRAME, this::onVBlank);
@@ -203,9 +240,52 @@ public final class GspGpuService extends AbstractService {
         handleTrivialSuccess(request, response);
     }
 
+    /// `GSPGPU_TriggerCmdReqQueue` (RFC-N3DSEMU G5/PR3) — até esta PR só contava o disparo (RFC/
+    /// task G3: "descarta tudo"). Agora lê de verdade a fila GX real da memória compartilhada
+    /// (ver Javadoc de {@link GxCommandQueue}), processa cada `ProcessCommandList` pendente contra
+    /// {@link #gpuRegisters}/{@link #shaderUpload} e sinaliza os eventos que o guest espera
+    /// (`gspWaitForEvent(GSPGPU_EVENT_P3D, ...)` — sem isso a thread principal trava esperando um
+    /// evento que nunca chega, mesma classe de bug já documentada para VBlank nesta classe).
     private void handleTriggerCmdReqQueue(IpcRequest request, IpcResponse response) {
         commandListsTriggered++;
+        Object resolvedBlock = handles.resolve(gspSharedMemoryHandle).orElse(null);
+        if (resolvedBlock instanceof MemoryBlockObject block && block.hostMapped()) {
+            List<Integer> events = GxCommandQueue.processPending(
+                    memory, block.address() + GX_COMMAND_QUEUE_OFFSET, this::handleCommandListWords);
+            for (int event : events) {
+                pushInterrupt(block.address(), event);
+            }
+            if (!events.isEmpty() && interruptEvent != null) {
+                interruptEvent.signal();
+            }
+        }
         handleTrivialSuccess(request, response);
+    }
+
+    /// Aplica uma lista de comandos PICA200 crua nos registradores/no upload de shader e, se um
+    /// `DrawArrays`/`DrawElements` de verdade foi disparado por ela, desenha no {@link #renderer}
+    /// (RFC-N3DSEMU G5/PR3). **Simplificação documentada**: sempre {@link Screen#TOP} — a única
+    /// tela composta por este HLE (RFC D6, mesma simplificação já usada em toda a G3/G4/G5). Se
+    /// múltiplos disparos acontecem dentro da MESMA lista, todos leem o estado FINAL dos
+    /// registradores (não um estado por disparo) — suficiente para `simple_tri`, que desenha uma
+    /// vez por lista.
+    private void handleCommandListWords(int[] words) {
+        long arraysBefore = gpuRegisters.drawArraysTriggerCount();
+        long elementsBefore = gpuRegisters.drawElementsTriggerCount();
+        CommandListParser.parse(words, gpuRegisters, shaderUpload);
+        if (renderer == null || !shaderUpload.hasProgram()) {
+            return;
+        }
+        if (gpuRegisters.drawArraysTriggerCount() > arraysBefore) {
+            VertexPipeline.drawArrays(shaderUpload.toShaderBinary(), shaderUpload.toExecutable(), gpuRegisters,
+                    memory, shaderUpload.floatConstants(), shaderUpload.intConstants(), shaderUpload.boolConstants(),
+                    shaderUpload.attributeToInputRegister(), Screen.TOP, renderer);
+        }
+        if (gpuRegisters.drawElementsTriggerCount() > elementsBefore) {
+            VertexPipeline.drawElements(shaderUpload.toShaderBinary(), shaderUpload.toExecutable(), gpuRegisters,
+                    memory, shaderUpload.floatConstants(), shaderUpload.intConstants(), shaderUpload.boolConstants(),
+                    shaderUpload.attributeToInputRegister(), Screen.TOP, renderer);
+        }
     }
 
     private void handleTrivialSuccess(IpcRequest request, IpcResponse response) {

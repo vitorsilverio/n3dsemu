@@ -2,8 +2,12 @@ package dev.vitorsilverio.n3dsemu.service;
 
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
+import dev.vitorsilverio.n3dsemu.gpu.PicaRegisters;
 import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
+import dev.vitorsilverio.n3dsemu.gpu.RecordingRenderer;
 import dev.vitorsilverio.n3dsemu.gpu.Screen;
+import dev.vitorsilverio.n3dsemu.gpu.ShadedVertex;
+import dev.vitorsilverio.n3dsemu.gpu.shader.ShaderUpload;
 import dev.vitorsilverio.n3dsemu.input.InputState;
 import dev.vitorsilverio.n3dsemu.ipc.IpcCommandHeader;
 import dev.vitorsilverio.n3dsemu.ipc.IpcRequest;
@@ -21,9 +25,12 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Testa {@link GspGpuService} isolado (RFC-N3DSEMU G3.2 — investigação da inanição do loop de
 /// `read-controls.3dsx`). Regressão do achado real da G3.2: `RegisterInterruptRelayQueue`
@@ -166,5 +173,150 @@ class GspGpuServiceTest {
         assertEquals(stride, buffer.stride());
         assertEquals(PixelFormat.RGB8, buffer.format());
         assertEquals(0, h.memory().read32(BUFFER_ADDRESS + 4)); // Result.SUCCESS
+    }
+
+    // ── RFC-N3DSEMU G5/PR3: integração real com a fila GX (TriggerCmdReqQueue lendo de verdade) ──
+
+    private static final int CMD_TRIGGER_CMD_REQ_QUEUE = 0xC;
+    private static final int COMMAND_LIST_ADDRESS = 0x1400_0000;
+    private static final int VERTEX_DATA_ADDRESS = 0x1400_1000;
+    private static final int GX_QUEUE_OFFSET = 0x800;
+
+    /// Monta a lista de comandos PICA200 crua que um app real produziria para desenhar um único
+    /// triângulo com um vertex shader `mov o0,v0 / mov o1,v1 / end` (posição/cor passadas direto,
+    /// mesmo formato de `simple_tri`): upload de shader por registrador-FIFO + formato de vértice
+    /// + `DrawArrays`. Layout de bits transcrito de {@link ShaderUpload} e
+    /// `VertexShaderInterpreter`/`VertexAttributeLoader` (mesmos offsets, sem reinventar).
+    private static int[] buildSimpleTriCommandList() {
+        List<Integer> words = new ArrayList<>();
+
+        // -- vertex shader: mov o0, v0 ; mov o1, v1 ; end (descritor 0 = máscara cheia, swizzle identidade) --
+        int identityDescriptor = 0xF | (0x1B << 5); // mask=xyzw, negate=0, selector identidade (result[c]=v[c])
+        int movOpcode = 0x13;
+        int endOpcode = 0x22;
+        int word0 = (movOpcode << 26); // mov o0(dst=0), v0(src1=0), desc=0
+        int word1 = (movOpcode << 26) | (1 << 21) | (1 << 12); // mov o1(dst=1), v1(src1=1), desc=0
+        int word2 = (endOpcode << 26);
+
+        writeReg(words, ShaderUpload.REG_OPDESCS_INDEX, 0);
+        writeReg(words, 0x2D6, identityDescriptor);
+        writeReg(words, ShaderUpload.REG_CODETRANSFER_INDEX, 0);
+        writeReg(words, 0x2CC, word0);
+        writeReg(words, 0x2CC, word1);
+        writeReg(words, 0x2CC, word2);
+        writeReg(words, ShaderUpload.REG_ENTRYPOINT, 0);
+        // Identidade completa (atributo N -> vN) — não só os 2 atributos usados: VertexPipeline
+        // (PR2) escreve TODO atributo em input[attributeToInputRegister[attributeId]], mesmo os
+        // não usados (que ficam com dado zerado); sem identidade nos demais, eles colidiriam no
+        // MESMO registrador de entrada v0 (mapeamento default 0) e sobrescreveriam v0 com zero.
+        writeReg(words, ShaderUpload.REG_ATTRIBUTES_PERMUTATION_LOW, 0x76543210);
+        writeReg(words, ShaderUpload.REG_ATTRIBUTES_PERMUTATION_HIGH, 0xBA98);
+
+        // -- formato de vértice: 2 atributos float4 (posição, cor), 1 loader, stride 32 --
+        writeReg(words, 0x200, (VERTEX_DATA_ADDRESS / 16) << 1); // endereço base
+        writeReg(words, 0x201, 0xFF); // atributo0/1: tipo FLOAT(3) + 4 componentes(3<<2), nibble 0xF cada
+        writeReg(words, 0x202, 0);
+        writeReg(words, 0x203, 0); // loader0: dataOffset=0
+        writeReg(words, 0x204, 0x10); // slot0=atributo0(posição), slot1=atributo1(cor)
+        writeReg(words, 0x205, (32 << 16) | (2 << 28)); // byteCount=32, componentCount=2
+        writeReg(words, 0x228, 3); // numVertices
+        writeReg(words, 0x22A, 0); // vertexOffset
+
+        writeReg(words, PicaRegisters.DRAW_ARRAYS, 1);
+
+        int[] array = new int[words.size()];
+        for (int i = 0; i < array.length; i++) {
+            array[i] = words.get(i);
+        }
+        return array;
+    }
+
+    private static void writeReg(List<Integer> words, int registerId, int value) {
+        int header = (registerId & 0xFFFF) | (0xF << 16); // máscara cheia, sem extras, não-consecutivo
+        words.add(value);
+        words.add(header);
+    }
+
+    private static void writeVertex(PagedAddressSpace memory, int index, float px, float py, float pz, float pw,
+                                     float r, float g, float b, float a) {
+        int base = VERTEX_DATA_ADDRESS + index * 32;
+        memory.write32(base, Float.floatToIntBits(px));
+        memory.write32(base + 4, Float.floatToIntBits(py));
+        memory.write32(base + 8, Float.floatToIntBits(pz));
+        memory.write32(base + 12, Float.floatToIntBits(pw));
+        memory.write32(base + 16, Float.floatToIntBits(r));
+        memory.write32(base + 20, Float.floatToIntBits(g));
+        memory.write32(base + 24, Float.floatToIntBits(b));
+        memory.write32(base + 28, Float.floatToIntBits(a));
+    }
+
+    /// **O teste-alvo desta PR (RFC-N3DSEMU G5/PR3)**: até aqui, `TriggerCmdReqQueue` só contava
+    /// o disparo — nenhuma lista de comandos PICA200 chegava a ser interpretada de verdade, então
+    /// `simple_tri` nunca desenhava nada mesmo com o resto da G5 pronto (parser/shader
+    /// interpretado/`VertexPipeline`/`VulkanRenderer` todos existiam, mas sem consumidor real).
+    /// Este teste monta a fila GX real (`gxCmdQueue_s`) na memória compartilhada com UM comando
+    /// `ProcessCommandList` apontando para uma lista PICA200 completa (upload de shader por
+    /// registrador-FIFO + formato de vértice + `DrawArrays`), dispara `TriggerCmdReqQueue` por
+    /// IPC — o MESMO caminho que `libctru`/`gspSubmitGxCommand` usam de verdade — e afirma que o
+    /// {@link RecordingRenderer} recebeu o triângulo com a posição/cor exatas dos vértices, sem
+    /// nenhuma alteração (o shader de teste é `mov`/`mov`/`end`, passagem direta).
+    @Test
+    void triggerCmdReqQueueProcessaListaDeComandosRealEDesenhaTrianguloDeVerdade() {
+        PrintStream log = new PrintStream(new ByteArrayOutputStream());
+        PagedAddressSpace memory = new PagedAddressSpace(PAGE_SHIFT, new LoggingOpenBus(log));
+        memory.mapRam(BUFFER_ADDRESS & ~0xFFF, new byte[1 << PAGE_SHIFT]);
+        memory.mapRam(SHARED_MEMORY_ADDRESS, new byte[1 << PAGE_SHIFT]);
+        memory.mapRam(COMMAND_LIST_ADDRESS, new byte[1 << PAGE_SHIFT]);
+        memory.mapRam(VERTEX_DATA_ADDRESS, new byte[1 << PAGE_SHIFT]);
+        HandleTable handles = new HandleTable(new ProcessObject(0), ThreadObject.mainThread(1, 0x30));
+        Scheduler scheduler = new Scheduler();
+        HidService hid = new HidService(log, memory, handles, new InputState(), null);
+        RecordingRenderer renderer = new RecordingRenderer();
+        GspGpuService gsp = new GspGpuService(log, memory, handles, scheduler, hid, renderer);
+
+        int eventHandle = handles.create(new EventObject(ResetType.STICKY));
+        memory.write32(BUFFER_ADDRESS, IpcCommandHeader.pack(CMD_REGISTER_INTERRUPT_RELAY_QUEUE, 1, 2));
+        memory.write32(BUFFER_ADDRESS + 4, 0);
+        memory.write32(BUFFER_ADDRESS + 8, IpcCommandHeader.moveHandleDescriptor(1));
+        memory.write32(BUFFER_ADDRESS + 12, eventHandle);
+        gsp.handleRequest(new IpcRequest(memory, BUFFER_ADDRESS), new IpcResponse(memory, BUFFER_ADDRESS));
+        int memHandle = memory.read32(BUFFER_ADDRESS + 4 * 4);
+        MemoryBlockObject block = (MemoryBlockObject) handles.resolve(memHandle).orElseThrow();
+        block.bindHostBacking(SHARED_MEMORY_ADDRESS);
+
+        writeVertex(memory, 0, -0.5f, -0.5f, 0f, 1f, 1f, 0f, 0f, 1f);
+        writeVertex(memory, 1, 0.5f, -0.5f, 0f, 1f, 0f, 1f, 0f, 1f);
+        writeVertex(memory, 2, 0.0f, 0.5f, 0f, 1f, 0f, 0f, 1f, 1f);
+
+        int[] commandList = buildSimpleTriCommandList();
+        for (int i = 0; i < commandList.length; i++) {
+            memory.write32(COMMAND_LIST_ADDRESS + 4 * i, commandList[i]);
+        }
+
+        // fila GX: 1 entrada pendente (ProcessCommandList) no cliente 0.
+        int queueBase = SHARED_MEMORY_ADDRESS + GX_QUEUE_OFFSET;
+        memory.write8(queueBase, 0); // commandIndex
+        memory.write8(queueBase + 1, 1); // totalCommands
+        int entryBase = queueBase + 0x8;
+        memory.write8(entryBase, 1); // tipo = ProcessCommandList
+        memory.write32(entryBase + 4, COMMAND_LIST_ADDRESS);
+        memory.write32(entryBase + 8, commandList.length * 4);
+
+        memory.write32(BUFFER_ADDRESS, IpcCommandHeader.pack(CMD_TRIGGER_CMD_REQ_QUEUE, 0, 0));
+        gsp.handleRequest(new IpcRequest(memory, BUFFER_ADDRESS), new IpcResponse(memory, BUFFER_ADDRESS));
+
+        List<ShadedVertex> triangle = renderer.lastTriangles(Screen.TOP);
+        assertTrue(triangle != null && triangle.size() == 3, "esperava 3 vértices desenhados de verdade");
+        assertEquals(-0.5f, triangle.get(0).ndcX());
+        assertEquals(-0.5f, triangle.get(0).ndcY());
+        assertEquals(1f, triangle.get(0).r());
+        assertEquals(0f, triangle.get(0).g());
+        assertEquals(0.5f, triangle.get(1).ndcX());
+        assertEquals(0.0f, triangle.get(2).ndcX());
+        assertEquals(1f, triangle.get(2).b());
+
+        // commandIndex avançou (a fila não fica "presa" reprocessando a mesma entrada) e o evento
+        // P3D foi sinalizado — sem isso, `gxCmdQueueWait`/`gspWaitForEvent` do guest travaria.
+        assertEquals(1, memory.read8(queueBase) & 0xFF);
     }
 }
