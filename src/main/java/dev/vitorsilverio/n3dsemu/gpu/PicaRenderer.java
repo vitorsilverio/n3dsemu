@@ -18,6 +18,11 @@ public interface PicaRenderer {
     /// nenhum estágio.
     void drawTriangles(Screen screen, java.util.List<ShadedVertex> vertices);
 
+    /// Cor com que o *color buffer* daquela tela foi limpo pelo app (`GX_MemoryFill`, disparado
+    /// por `C3D_RenderTargetClear`) — é o FUNDO sobre o qual {@link #drawTriangles} desenha.
+    /// Componentes normalizados em `[0,1]`.
+    void setClearColor(Screen screen, float[] rgba);
+
     /// Entrega o conteúdo de uma tela para apresentação.
     ///
     /// `pixels` está no formato e na orientação do 3DS (varredura por coluna, origem no canto

@@ -4,6 +4,7 @@ import dev.vitorsilverio.armjitter.memory.AddressSpace;
 import dev.vitorsilverio.n3dsemu.gpu.CommandListParser;
 import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
 import dev.vitorsilverio.n3dsemu.gpu.GxCommandQueue;
+import dev.vitorsilverio.n3dsemu.gpu.ColorBufferFormat;
 import dev.vitorsilverio.n3dsemu.gpu.FixedAttributes;
 import dev.vitorsilverio.n3dsemu.gpu.PicaRegisters;
 import dev.vitorsilverio.n3dsemu.gpu.RegisterWriteListener;
@@ -292,6 +293,10 @@ public final class GspGpuService extends AbstractService {
         if (renderer == null || !shaderUpload.hasProgram()) {
             return;
         }
+        if (gpuRegisters.drawArraysTriggerCount() > arraysBefore
+                || gpuRegisters.drawElementsTriggerCount() > elementsBefore) {
+            renderer.setClearColor(Screen.TOP, readColorBufferClearColor());
+        }
         if (gpuRegisters.drawArraysTriggerCount() > arraysBefore) {
             VertexPipeline.drawArrays(shaderUpload.toShaderBinary(), shaderUpload.toExecutable(), gpuRegisters,
                     memory, shaderUpload.floatConstants(), shaderUpload.intConstants(), shaderUpload.boolConstants(),
@@ -302,6 +307,17 @@ public final class GspGpuService extends AbstractService {
                     memory, shaderUpload.floatConstants(), shaderUpload.intConstants(), shaderUpload.boolConstants(),
                     shaderUpload.attributeToInputRegister(), fixedAttributes, Screen.TOP, renderer);
         }
+    }
+
+    /// Cor de fundo do quadro: o `GX_MemoryFill` disparado por `C3D_RenderTargetClear` já pintou
+    /// o *color buffer* inteiro com ela (ver `GxCommandQueue#fillBuffer`), então basta ler o pixel
+    /// inicial do buffer no formato que os registradores declaram — mais simples e mais fiel do
+    /// que tentar casar o endereço do preenchimento com o da tela, e funciona igual para um app
+    /// que limpe a tela escrevendo direto na memória em vez de usar o `MemoryFill`.
+    private float[] readColorBufferClearColor() {
+        int location = gpuRegisters.read(ColorBufferFormat.REGISTER_LOCATION);
+        ColorBufferFormat format = ColorBufferFormat.fromRegister(gpuRegisters.read(ColorBufferFormat.REGISTER));
+        return format.readPixel(memory, ColorBufferFormat.locationFromRegister(location));
     }
 
     private void handleTrivialSuccess(IpcRequest request, IpcResponse response) {

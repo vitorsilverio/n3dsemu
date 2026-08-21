@@ -11,6 +11,7 @@ import java.util.Map;
 public final class RecordingRenderer implements PicaRenderer {
     private final Map<Screen, byte[]> lastRgba8 = new EnumMap<>(Screen.class);
     private final Map<Screen, java.util.List<ShadedVertex>> lastTriangles = new EnumMap<>(Screen.class);
+    private final Map<Screen, float[]> lastClearColor = new EnumMap<>(Screen.class);
     private int frameCount;
     private boolean closed;
 
@@ -23,6 +24,16 @@ public final class RecordingRenderer implements PicaRenderer {
     /// {@link #drawTriangles} nunca foi chamado para essa tela.
     public java.util.List<ShadedVertex> lastTriangles(Screen screen) {
         return lastTriangles.get(screen);
+    }
+
+    @Override
+    public void setClearColor(Screen screen, float[] rgba) {
+        lastClearColor.put(screen, rgba.clone());
+    }
+
+    /// Última cor de limpeza recebida para `screen` (RFC G5.3), ou `null` se nenhuma.
+    public float[] lastClearColor(Screen screen) {
+        return lastClearColor.get(screen);
     }
 
     @Override

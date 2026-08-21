@@ -43,6 +43,27 @@ public final class GxCommandQueue {
     private static final int ENTRY_OFFSET_ARG1 = 0x4;
     private static final int ENTRY_OFFSET_ARG2 = 0x8;
 
+    // `GX_MemoryFill(buf0a, buf0v, buf0e, control0, buf1a, buf1v, buf1e, control1)` — layout
+    // transcrito de `libctru/source/gpu/gx.c` real: 7 argumentos de 32 bits depois do tipo, com
+    // os DOIS controles de 16 bits espremidos no último. Os endereços são VIRTUAIS (a função só
+    // copia os ponteiros do app; quem converte para físico é o `GPUREG_*_LOC` da lista de
+    // comandos, não isto).
+    private static final int MEMORY_FILL_BUFFER0_START = 0x4;
+    private static final int MEMORY_FILL_BUFFER1_START = 0x10;
+    private static final int MEMORY_FILL_CONTROLS = 0x1C;
+    private static final int MEMORY_FILL_VALUE_OFFSET = 0x4;
+    private static final int MEMORY_FILL_END_OFFSET = 0x8;
+    private static final int MEMORY_FILL_CONTROL1_SHIFT = 16;
+    private static final int MEMORY_FILL_CONTROL_MASK = 0xFFFF;
+    /// `GX_FILL_TRIGGER` (`gx.h`): sem ele o buffer não é preenchido — é assim que
+    /// `C3D_RenderTargetClear` pede só a cor (`C3D_CLEAR_COLOR`) sem mexer no *depth buffer*.
+    private static final int FILL_TRIGGER = 0x001;
+    /// Largura do padrão de preenchimento (`GX_FILL_*_DEPTH` de `gx.h`): `0x000`=16 bits,
+    /// `0x100`=24 bits, `0x200`=32 bits.
+    private static final int FILL_WIDTH_MASK = 0x300;
+    private static final int FILL_WIDTH_16_BIT = 0x000;
+    private static final int FILL_WIDTH_24_BIT = 0x100;
+
     private static final int TYPE_REQUEST_DMA = 0;
     private static final int TYPE_PROCESS_COMMAND_LIST = 1;
     private static final int TYPE_MEMORY_FILL = 2;
@@ -113,11 +134,55 @@ public final class GxCommandQueue {
                 sink.onCommandList(readWords(memory, bufferAddress, bufferSizeBytes / Integer.BYTES));
                 events.add(EVENT_P3D);
             }
-            case TYPE_MEMORY_FILL -> events.add(EVENT_PSC0);
+            case TYPE_MEMORY_FILL -> {
+                int controls = memory.read32(entryBase + MEMORY_FILL_CONTROLS);
+                fillBuffer(memory, entryBase + MEMORY_FILL_BUFFER0_START, controls & MEMORY_FILL_CONTROL_MASK);
+                fillBuffer(memory, entryBase + MEMORY_FILL_BUFFER1_START,
+                        (controls >>> MEMORY_FILL_CONTROL1_SHIFT) & MEMORY_FILL_CONTROL_MASK);
+                events.add(EVENT_PSC0);
+            }
             case TYPE_DISPLAY_TRANSFER, TYPE_TEXTURE_COPY -> events.add(EVENT_PPF);
             case TYPE_REQUEST_DMA -> events.add(EVENT_DMA);
             case TYPE_FLUSH_CACHE_REGIONS -> { } // 3dbrew: não enfileirável/sem evento de conclusão próprio.
             default -> { } // tipo desconhecido: ignora, mesma postura conservadora do resto do HLE.
+        }
+    }
+
+    /// Preenche `[start, end)` com o padrão pedido — o `GX_MemoryFill` de verdade (RFC-N3DSEMU
+    /// G5.3). É ele que pinta o *color buffer* com a cor de fundo do app (`C3D_RenderTargetClear`)
+    /// e zera o *depth buffer* a cada quadro; até a G5.2 o comando era dado como concluído sem
+    /// nenhum efeito de memória, e o fundo da tela ficava preto em vez da cor pedida.
+    ///
+    /// O hardware escreve o padrão na largura indicada pelo controle, então um preenchimento de 16
+    /// bits repete meia palavra — não dá para tratar tudo como 32 bits.
+    private static void fillBuffer(AddressSpace memory, int bufferBase, int control) {
+        if ((control & FILL_TRIGGER) == 0) {
+            return;
+        }
+        int start = memory.read32(bufferBase);
+        int value = memory.read32(bufferBase + MEMORY_FILL_VALUE_OFFSET);
+        int end = memory.read32(bufferBase + MEMORY_FILL_END_OFFSET);
+        if (start == 0 || Integer.compareUnsigned(end, start) <= 0) {
+            return;
+        }
+        switch (control & FILL_WIDTH_MASK) {
+            case FILL_WIDTH_16_BIT -> {
+                for (int address = start; Integer.compareUnsigned(address, end) < 0; address += Short.BYTES) {
+                    memory.write16(address, value & 0xFFFF);
+                }
+            }
+            case FILL_WIDTH_24_BIT -> {
+                for (int address = start; Integer.compareUnsigned(address, end) < 0; address += 3) {
+                    memory.write8(address, value & 0xFF);
+                    memory.write8(address + 1, (value >>> 8) & 0xFF);
+                    memory.write8(address + 2, (value >>> 16) & 0xFF);
+                }
+            }
+            default -> {
+                for (int address = start; Integer.compareUnsigned(address, end) < 0; address += Integer.BYTES) {
+                    memory.write32(address, value);
+                }
+            }
         }
     }
 

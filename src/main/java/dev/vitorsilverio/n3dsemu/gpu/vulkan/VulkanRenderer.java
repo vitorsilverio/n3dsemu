@@ -109,11 +109,15 @@ public final class VulkanRenderer implements PicaRenderer {
     /// corrente do *color buffer* daquela tela, redesenhado a cada apresentação até a lista de
     /// comandos seguinte substituí-lo.
     private final Map<Screen, List<ShadedVertex>> screenGeometry = new EnumMap<>(Screen.class);
+    /// Cor de fundo por tela (`GX_MemoryFill` do app, RFC G5.3) — o *load* do render pass de
+    /// geometria. Preto até o primeiro `C3D_RenderTargetClear` do guest.
+    private final Map<Screen, float[]> clearColors = new EnumMap<>(Screen.class);
     /// Recursos (ex.: *vertex buffers* descartáveis de {@link #drawPendingTriangles}) só podem
     /// ser liberados depois que a GPU terminar de usá-los — um balde por *frame in flight*,
     /// esvaziado logo após {@code vkWaitForFences} confirmar que aquele *slot* está livre de
     /// novo (RFC G5/PR2, "sem otimização": um `vkDestroyBuffer` por desenho é aceitável aqui).
     private final List<Runnable>[] frameCleanup;
+    private static final float[] OPAQUE_BLACK = {0f, 0f, 0f, 1f};
     private boolean framebufferResized;
     private boolean closed;
 
@@ -221,6 +225,11 @@ public final class VulkanRenderer implements PicaRenderer {
     @Override
     public void drawTriangles(Screen screen, List<ShadedVertex> vertices) {
         screenGeometry.put(screen, List.copyOf(vertices));
+    }
+
+    @Override
+    public void setClearColor(Screen screen, float[] rgba) {
+        clearColors.put(screen, rgba.clone());
     }
 
     @Override
@@ -741,8 +750,10 @@ public final class VulkanRenderer implements PicaRenderer {
             long vertexBuffer = vertexBufferAndMemory[0];
             long vertexBufferMemory = vertexBufferAndMemory[1];
 
+            float[] clear = clearColors.getOrDefault(entry.getKey(), OPAQUE_BLACK);
             VkClearValue.Buffer clearValues = VkClearValue.calloc(1, stack);
-            clearValues.get(0).color().float32(0, 0f).float32(1, 0f).float32(2, 0f).float32(3, 1f);
+            clearValues.get(0).color()
+                    .float32(0, clear[0]).float32(1, clear[1]).float32(2, clear[2]).float32(3, clear[3]);
             VkRenderPassBeginInfo renderPassInfo = VkRenderPassBeginInfo.calloc(stack)
                     .sType(VK10.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
                     .renderPass(geometryRenderPass)
