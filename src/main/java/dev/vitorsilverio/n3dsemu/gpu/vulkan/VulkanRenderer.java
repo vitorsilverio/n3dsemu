@@ -46,6 +46,15 @@ public final class VulkanRenderer implements PicaRenderer {
     /// Vulkan") sem precisar de um host real sem driver — usado pelo teste de fumaça desta
     /// classe para exercitar o caminho `Assumptions.assumeTrue` também numa máquina COM GPU.
     private static final String FORCE_UNAVAILABLE_PROPERTY = "n3dsemu.vulkan.force-unavailable";
+    /// Cria a janela GLFW **oculta** (`GLFW_VISIBLE=false`) — usado pelos testes de fumaça desta
+    /// classe (`VulkanRendererSmokeTest`), que precisam exercitar a pilha Vulkan real (instância/
+    /// swapchain/*render pass*/apresentação) sem depender de GPU alguma ficar visível. Achado
+    /// real (2026-08-21): sem isto, `mvn test` abria uma janela real na tela a cada execução —
+    /// como o teste desenha um triângulo de teste sintético (RGB, hardcoded, nada a ver com
+    /// nenhuma ROM), isso já confundiu mais de uma sessão de depuração fazendo parecer que
+    /// `simple_tri.3dsx`/G5.1 tinha funcionado quando na verdade era só este teste passando. `Main`
+    /// (uso real, modo janela) nunca define esta propriedade — continua visível por padrão.
+    private static final String HIDDEN_WINDOW_PROPERTY = "n3dsemu.vulkan.hidden-window";
     private static final int FRAMES_IN_FLIGHT = 2;
     private static final long NO_TIMEOUT = -1L; // UINT64_MAX quando passado como long para vkWaitForFences/vkAcquireNextImageKHR
 
@@ -145,6 +154,9 @@ public final class VulkanRenderer implements PicaRenderer {
             }
             glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
             glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+            if (Boolean.getBoolean(HIDDEN_WINDOW_PROPERTY)) {
+                glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+            }
             // RFC/task: as duas telas empilhadas verticalmente, topo 400 de largura.
             this.window = glfwCreateWindow(400, 240 + 320, "n3dsemu", MemoryUtil.NULL, MemoryUtil.NULL);
             if (window == MemoryUtil.NULL) {

@@ -5,6 +5,7 @@ import dev.vitorsilverio.n3dsemu.gpu.Screen;
 import dev.vitorsilverio.n3dsemu.gpu.ShadedVertex;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -15,14 +16,27 @@ import java.util.List;
 /// `Assumptions.assumeTrue` quando não há GPU/driver Vulkan (CI, RFC/task) — inclusive quando
 /// simulado por `-Dn3dsemu.vulkan.force-unavailable=true` (Aceite: "simule... numa máquina sem
 /// Vulkan").
+///
+/// **Janela oculta (achado real, 2026-08-21)**: sem `n3dsemu.vulkan.hidden-window=true`, cada
+/// `mvn test` abria uma janela real na tela desenhando o triângulo SINTÉTICO deste teste (RGB
+/// hardcoded, nada a ver com nenhuma ROM) — confundiu mais de uma sessão de depuração do bug real
+/// de `simple_tri.3dsx` (G5.1/`tasks/trilha-g-3ds/`), fazendo parecer que o EMULADOR tinha
+/// funcionado quando era só este teste de fumaça passando. `VulkanRenderer` continua exercitando a
+/// pilha real (instância/swapchain/*render pass*/apresentação); só a visibilidade da janela muda.
 class VulkanRendererSmokeTest {
     private VulkanRenderer renderer;
+
+    @BeforeEach
+    void hideWindow() {
+        System.setProperty("n3dsemu.vulkan.hidden-window", "true");
+    }
 
     @AfterEach
     void closeRenderer() {
         if (renderer != null) {
             renderer.close();
         }
+        System.clearProperty("n3dsemu.vulkan.hidden-window");
     }
 
     @Test
