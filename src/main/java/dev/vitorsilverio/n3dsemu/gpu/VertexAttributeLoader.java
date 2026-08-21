@@ -75,6 +75,21 @@ public final class VertexAttributeLoader {
         return numComponents(attributeId) * elementSizeBytes(attributeId);
     }
 
+    /// Quantos atributos de vértice estão ATIVOS (`max_attribute_index + 1`, bits 28-31 de
+    /// `0x202` — mesmo campo que o `Pica::PipelineRegs` do Citra chama de `max_attribute_index`).
+    /// Os 12 slots do formato existem sempre, mas só os `numAttributes()` primeiros têm
+    /// significado; tratar os outros como atributos reais faz a permutação
+    /// atributo→registrador-de-entrada (todos com nibble `0`) sobrescrever `v0` com zeros.
+    public int numAttributes() {
+        return ((registers.read(REG_FORMAT_HIGH) >>> 28) & 0xF) + 1;
+    }
+
+    /// `true` se o atributo vem de um *array* na memória; `false` se é um atributo FIXO, cujo
+    /// valor vem dos registradores de {@link FixedAttributes} e não da memória do guest.
+    public boolean isLoadedFromArray(int attributeId) {
+        return buildLoaderMap().vertexStride[attributeId] != 0;
+    }
+
     public int numVertices() {
         return registers.read(REG_NUM_VERTICES);
     }

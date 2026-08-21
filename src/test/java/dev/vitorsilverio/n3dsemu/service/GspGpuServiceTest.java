@@ -127,7 +127,6 @@ class GspGpuServiceTest {
         block.bindHostBacking(SHARED_MEMORY_ADDRESS);
 
         h.gsp().onVBlank();
-        h.gsp().onVBlank();
 
         int readCursorOffset = 0x0;
         int countOffset = 0x1;
@@ -137,10 +136,13 @@ class GspGpuServiceTest {
         // contagem avança.
         assertEquals(0, h.memory().read8(SHARED_MEMORY_ADDRESS + readCursorOffset) & 0xFF);
         assertEquals(2, h.memory().read8(SHARED_MEMORY_ADDRESS + countOffset) & 0xFF);
-        // As duas entradas caem em slots DIFERENTES e corretos: (readCursor=0+count) a cada
-        // chamada, não ambas no slot 0 nem no slot do cursor de leitura avançado incorretamente.
+        // Um VBlank enfileira DUAS interrupções — `PDC0` (topo) e `PDC1` (baixo): o citro3d conta
+        // as duas separadamente e `C3D_FrameSync` só destrava quando as DUAS avançam (ver Javadoc
+        // de GspGpuService). As entradas caem em slots consecutivos derivados de
+        // `(readCursor + count)`, não ambas no slot 0.
+        int pdc1VBlankBottom = 3;
         assertEquals(pdc0VBlankTop, h.memory().read8(SHARED_MEMORY_ADDRESS + entriesOffset) & 0xFF);
-        assertEquals(pdc0VBlankTop, h.memory().read8(SHARED_MEMORY_ADDRESS + entriesOffset + 1) & 0xFF);
+        assertEquals(pdc1VBlankBottom, h.memory().read8(SHARED_MEMORY_ADDRESS + entriesOffset + 1) & 0xFF);
     }
 
     private static final int CMD_SET_BUFFER_SWAP = 0x5;
@@ -216,7 +218,7 @@ class GspGpuServiceTest {
         // -- formato de vértice: 2 atributos float4 (posição, cor), 1 loader, stride 32 --
         writeReg(words, 0x200, (VERTEX_DATA_ADDRESS / 16) << 1); // endereço base
         writeReg(words, 0x201, 0xFF); // atributo0/1: tipo FLOAT(3) + 4 componentes(3<<2), nibble 0xF cada
-        writeReg(words, 0x202, 0);
+        writeReg(words, 0x202, 1 << 28); // max_attribute_index=1 -> 2 atributos ativos
         writeReg(words, 0x203, 0); // loader0: dataOffset=0
         writeReg(words, 0x204, 0x10); // slot0=atributo0(posição), slot1=atributo1(cor)
         writeReg(words, 0x205, (32 << 16) | (2 << 28)); // byteCount=32, componentCount=2
@@ -298,7 +300,7 @@ class GspGpuServiceTest {
         int queueBase = SHARED_MEMORY_ADDRESS + GX_QUEUE_OFFSET;
         memory.write8(queueBase, 0); // commandIndex
         memory.write8(queueBase + 1, 1); // totalCommands
-        int entryBase = queueBase + 0x8;
+        int entryBase = queueBase + 0x20; // cabeçalho de 0x20 bytes (gspSubmitGxCommand real)
         memory.write8(entryBase, 1); // tipo = ProcessCommandList
         memory.write32(entryBase + 4, COMMAND_LIST_ADDRESS);
         memory.write32(entryBase + 8, commandList.length * 4);
@@ -319,6 +321,10 @@ class GspGpuServiceTest {
         // commandIndex avançou (a fila não fica "presa" reprocessando a mesma entrada) e o evento
         // P3D foi sinalizado — sem isso, `gxCmdQueueWait`/`gspWaitForEvent` do guest travaria.
         assertEquals(1, memory.read8(queueBase) & 0xFF);
+        // ...e a CONTAGEM de pendentes voltou a zero: é o que faz `gspSubmitGxCommand` disparar
+        // `GSPGPU_TriggerCmdReqQueue` de novo no quadro seguinte (só dispara quando a fila estava
+        // vazia). Sem zerar, o app congela depois do primeiro quadro.
+        assertEquals(0, memory.read8(queueBase + 1) & 0xFF);
 
         // Investigação G5.1 (2026-08-21): confirma que a entrega do evento P3D (id=5, "Command
         // list processing finished" — GSPGPU_Event real, ver Javadoc de GxCommandQueue) para a

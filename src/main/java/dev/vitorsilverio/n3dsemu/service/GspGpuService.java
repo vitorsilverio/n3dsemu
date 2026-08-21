@@ -4,7 +4,9 @@ import dev.vitorsilverio.armjitter.memory.AddressSpace;
 import dev.vitorsilverio.n3dsemu.gpu.CommandListParser;
 import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
 import dev.vitorsilverio.n3dsemu.gpu.GxCommandQueue;
+import dev.vitorsilverio.n3dsemu.gpu.FixedAttributes;
 import dev.vitorsilverio.n3dsemu.gpu.PicaRegisters;
+import dev.vitorsilverio.n3dsemu.gpu.RegisterWriteListener;
 import dev.vitorsilverio.n3dsemu.gpu.PicaRenderer;
 import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
 import dev.vitorsilverio.n3dsemu.gpu.Screen;
@@ -104,6 +106,17 @@ public final class GspGpuService extends AbstractService {
     /// `PDC0`/`VBlankTop` (3dbrew: GSP Shared Memory, "Interrupt list") — a única interrupção
     /// que esta HLE gera (RFC D6: só a tela de cima é composta na prática por este marco).
     private static final int INTERRUPT_TYPE_PDC0_VBLANK_TOP = 2;
+    /// `PDC1`/`VBlankBottom` (3dbrew: mesma "Interrupt list"). **Achado real (G5.2)**: não basta
+    /// gerar `PDC0`. O citro3d (`renderqueue.c`, fonte real) mantém DOIS contadores de quadro —
+    /// `frameCounter[0]` incrementado pelo callback de `GSPGPU_EVENT_VBlank0` e `frameCounter[1]`
+    /// pelo de `VBlank1` — e `C3D_FrameSync` (chamado por `C3D_FrameBegin(C3D_FRAME_SYNCDRAW)`,
+    /// exatamente o que `simple_tri` usa) gira em
+    /// `while (cur[0]==start[0] || cur[1]==start[1])`: só sai quando os DOIS avançam. Com apenas
+    /// `PDC0`, `frameCounter[1]` ficava parado para sempre e a thread principal nunca voltava de
+    /// `C3D_FrameBegin` — nenhuma lista de comando GX chegava a ser submetida (a fila GX da
+    /// memória compartilhada permanecia 100% zerada, confirmado por dump), e a tela ficava preta
+    /// mesmo com todo o resto da G5 pronto.
+    private static final int INTERRUPT_TYPE_PDC1_VBLANK_BOTTOM = 3;
     private static final int U8_MASK = 0xFF;
 
     /// `FrameBufferUpdate` (3dbrew "GSP Shared Memory"; layout confirmado por `WebFetch` na wiki
@@ -157,6 +170,9 @@ public final class GspGpuService extends AbstractService {
     /// Javadoc de {@link ShaderUpload}) — como {@link #gpuRegisters}, sobrevive entre listas
     /// (RFC/task: um app típico faz upload do shader uma vez e desenha em vários quadros depois).
     private final ShaderUpload shaderUpload = new ShaderUpload();
+    /// Valores dos atributos de vértice FIXOS (RFC-N3DSEMU G5/PR4) — como {@link #gpuRegisters},
+    /// sobrevivem entre listas de comando.
+    private final FixedAttributes fixedAttributes = new FixedAttributes();
     /// Destino real do desenho (RFC-N3DSEMU G5/PR3) — `null` no modo `--headless`/testes que não
     /// precisam de saída gráfica (RFC/task G3: comportamento herdado, "descarta tudo" quando não
     /// há para onde desenhar).
@@ -272,19 +288,19 @@ public final class GspGpuService extends AbstractService {
     private void handleCommandListWords(int[] words) {
         long arraysBefore = gpuRegisters.drawArraysTriggerCount();
         long elementsBefore = gpuRegisters.drawElementsTriggerCount();
-        CommandListParser.parse(words, gpuRegisters, shaderUpload);
+        CommandListParser.parse(words, gpuRegisters, RegisterWriteListener.all(shaderUpload, fixedAttributes));
         if (renderer == null || !shaderUpload.hasProgram()) {
             return;
         }
         if (gpuRegisters.drawArraysTriggerCount() > arraysBefore) {
             VertexPipeline.drawArrays(shaderUpload.toShaderBinary(), shaderUpload.toExecutable(), gpuRegisters,
                     memory, shaderUpload.floatConstants(), shaderUpload.intConstants(), shaderUpload.boolConstants(),
-                    shaderUpload.attributeToInputRegister(), Screen.TOP, renderer);
+                    shaderUpload.attributeToInputRegister(), fixedAttributes, Screen.TOP, renderer);
         }
         if (gpuRegisters.drawElementsTriggerCount() > elementsBefore) {
             VertexPipeline.drawElements(shaderUpload.toShaderBinary(), shaderUpload.toExecutable(), gpuRegisters,
                     memory, shaderUpload.floatConstants(), shaderUpload.intConstants(), shaderUpload.boolConstants(),
-                    shaderUpload.attributeToInputRegister(), Screen.TOP, renderer);
+                    shaderUpload.attributeToInputRegister(), fixedAttributes, Screen.TOP, renderer);
         }
     }
 
@@ -303,6 +319,7 @@ public final class GspGpuService extends AbstractService {
             readFramebufferUpdate(block.address() + FRAMEBUFFER_UPDATE_TOP_OFFSET, Screen.TOP);
             readFramebufferUpdate(block.address() + FRAMEBUFFER_UPDATE_BOTTOM_OFFSET, Screen.BOTTOM);
             pushInterrupt(block.address(), INTERRUPT_TYPE_PDC0_VBLANK_TOP);
+            pushInterrupt(block.address(), INTERRUPT_TYPE_PDC1_VBLANK_BOTTOM);
         }
         if (interruptEvent != null) {
             interruptEvent.signal();

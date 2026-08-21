@@ -50,6 +50,11 @@ public final class MemoryMap {
 
     /// VRAM: 2 bancos de 3 MiB (RFC §3/D6).
     public static final int VRAM_BASE = 0x1800_0000;
+    /// Endereço VIRTUAL da mesma VRAM (`OS_VRAM_VADDR` do libctru real, `os.h`) — é por aqui que
+    /// a CPU do guest escreve nos framebuffers; {@link #VRAM_BASE} é o endereço FÍSICO que os
+    /// registradores da PICA200 carregam. As duas janelas espelham as MESMAS páginas (ver
+    /// `N3dsAddressSpace#create`).
+    public static final int VRAM_VIRTUAL_BASE = 0x1F00_0000;
     public static final int VRAM_SIZE = 6 * 1024 * 1024;
 
     /// DSP RAM (fora de escopo funcional até D7, mas mapeada como RAM comum).

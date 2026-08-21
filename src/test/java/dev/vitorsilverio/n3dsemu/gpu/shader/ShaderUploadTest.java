@@ -61,20 +61,40 @@ class ShaderUploadTest {
         };
         CommandListParser.parse(words, registers, upload);
 
-        assertArrayEquals(new float[]{1.0f, 2.0f, 3.0f, 4.0f}, upload.floatConstants()[5]);
+        // A ORDEM É INVERTIDA: a primeira palavra do FIFO é o componente `w` (ver
+        // ShaderUpload#decodeFloat32Constant — confirmado contra a matriz real do `simple_tri`).
+        assertArrayEquals(new float[]{4.0f, 3.0f, 2.0f, 1.0f}, upload.floatConstants()[5]);
     }
 
     @Test
-    void float24ModeThrowsUnsupported() {
+    void capturesFloat24UniformAsThreePackedWords() {
         PicaRegisters registers = new PicaRegisters();
         ShaderUpload upload = new ShaderUpload();
-        int config = 0; // bit31=0 -> modo float24, não implementado
+        int config = 5; // índice=5, bit31=0 -> modo float24 (empacotado), o default do citro3d
+        // (1.0, 2.0, 3.0, 4.0) em float24: expoente com bias 63, mantissa de 16 bits.
+        int x = float24Bits(1.0f);
+        int y = float24Bits(2.0f);
+        int z = float24Bits(3.0f);
+        int w = float24Bits(4.0f);
         int[] words = {
                 config, header(ShaderUpload.REG_FLOAT_UNIFORM_CONFIG, 0, false),
-                0x1, header(0x2C1, 0, false),
+                (w << 8) | (z >>> 16), header(0x2C1, 0, false),
+                (z << 16) | (y >>> 8), header(0x2C1, 0, false),
+                (y << 24) | x, header(0x2C1, 0, false),
         };
+        CommandListParser.parse(words, registers, upload);
 
-        assertThrows(UnsupportedOperationException.class, () -> CommandListParser.parse(words, registers, upload));
+        assertArrayEquals(new float[]{1.0f, 2.0f, 3.0f, 4.0f}, upload.floatConstants()[5]);
+    }
+
+    /// Codifica um `float` no formato de 24 bits do PICA200 (1 sinal + 7 expoente/bias 63 + 16
+    /// mantissa) — inverso de {@link dev.vitorsilverio.n3dsemu.gpu.shader.Float24#decode}.
+    private static int float24Bits(float value) {
+        int bits = Float.floatToIntBits(value);
+        int sign = (bits >>> 31) & 1;
+        int exponent = ((bits >>> 23) & 0xFF) - 127 + 63;
+        int mantissa = (bits >>> 7) & 0xFFFF;
+        return (sign << 23) | (exponent << 16) | mantissa;
     }
 
     @Test

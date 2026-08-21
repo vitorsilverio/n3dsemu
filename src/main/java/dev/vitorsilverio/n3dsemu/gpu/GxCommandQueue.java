@@ -21,12 +21,23 @@ import java.util.List;
 /// (`C:\devkitPro\libctru\include\3ds\gpu\gx.h`, fonte real do lado do cliente).
 public final class GxCommandQueue {
     private static final int OFFSET_COMMAND_INDEX = 0x0;
+    /// **Número de comandos PENDENTES**, não um índice final (achado real da G5.2, conferido
+    /// contra `gspSubmitGxCommand` no `libctru/source/services/gspgpu.c`: o cliente lê
+    /// `totalCommands=(hdr>>8)&0xFF`, escreve no slot `(commandIndex+totalCommands)%15`, INCREMENTA
+    /// este campo e só chama `GSPGPU_TriggerCmdReqQueue()` quando o valor pós-incremento é `1`,
+    /// isto é, quando a fila estava VAZIA). Cabe ao GSP DECREMENTAR o campo à medida que consome:
+    /// sem isso o contador nunca volta a zero, o cliente nunca mais dispara a IPC de trigger e a
+    /// fila congela para sempre depois do primeiro quadro.
     private static final int OFFSET_TOTAL_COMMANDS = 0x1;
-    private static final int OFFSET_ENTRIES = 0x8;
+    /// Cabeçalho de **0x20 bytes** (`gspSubmitGxCommand` real: `dst=&sharedGspCmdBuf[8*(1+slot)]`
+    /// em palavras de 32 bits → byte `0x20 + slot*0x20`). A G5/PR3 usava `0x8` — lia a palavra 2 do
+    /// cabeçalho como se fosse o começo da primeira entrada, e o `type` decodificado saía sempre
+    /// `0` (`RequestDma`) em vez do comando real.
+    private static final int OFFSET_ENTRIES = 0x20;
     private static final int ENTRY_SIZE_BYTES = 0x20;
-    /// `0x200` bytes reservados por cliente menos o cabeçalho de `0x8`, a 32 bytes/entrada — o
-    /// mesmo limite prático usado pelo `gxCmdQueue_s` do libctru real.
-    private static final int MAX_ENTRIES = (0x200 - OFFSET_ENTRIES) / ENTRY_SIZE_BYTES;
+    /// 15 slots — valor LITERAL do `%15` de `gspSubmitGxCommand` (o `0x200` por cliente comporta
+    /// 15 entradas de 32 bytes depois do cabeçalho de 32 bytes, com 0 bytes de sobra).
+    private static final int MAX_ENTRIES = 15;
 
     private static final int ENTRY_OFFSET_TYPE = 0x0;
     private static final int ENTRY_OFFSET_ARG1 = 0x4;
@@ -76,14 +87,20 @@ public final class GxCommandQueue {
     public static List<Integer> processPending(AddressSpace memory, int queueBase, CommandListSink sink) {
         List<Integer> events = new ArrayList<>();
         int commandIndex = memory.read8(queueBase + OFFSET_COMMAND_INDEX) & U8_MASK;
-        int totalCommands = memory.read8(queueBase + OFFSET_TOTAL_COMMANDS) & U8_MASK;
-        while (commandIndex != totalCommands) {
+        int pending = memory.read8(queueBase + OFFSET_TOTAL_COMMANDS) & U8_MASK;
+        for (int processed = 0; processed < pending; processed++) {
             int entryBase = queueBase + OFFSET_ENTRIES + (commandIndex % MAX_ENTRIES) * ENTRY_SIZE_BYTES;
             int type = memory.read8(entryBase + ENTRY_OFFSET_TYPE) & U8_MASK;
             processEntry(memory, entryBase, type, sink, events);
-            commandIndex = (commandIndex + 1) & U8_MASK;
+            commandIndex = (commandIndex + 1) % MAX_ENTRIES;
         }
         memory.write8(queueBase + OFFSET_COMMAND_INDEX, commandIndex);
+        // Devolve a fila VAZIA ao cliente: o `pending` lido acima foi todo consumido aqui (este
+        // HLE processa a lista inteira de forma síncrona dentro da própria IPC de trigger, ao
+        // contrário do GSP real, que é assíncrono). Sem zerar, `gspSubmitGxCommand` nunca voltaria
+        // a ver `totalCommands==1` e nunca mais dispararia `GSPGPU_TriggerCmdReqQueue`.
+        int remaining = (memory.read8(queueBase + OFFSET_TOTAL_COMMANDS) & U8_MASK) - pending;
+        memory.write8(queueBase + OFFSET_TOTAL_COMMANDS, Math.max(0, remaining));
         return events;
     }
 

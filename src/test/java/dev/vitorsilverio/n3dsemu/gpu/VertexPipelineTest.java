@@ -47,7 +47,7 @@ class VertexPipelineTest {
         RecordingRenderer renderer = new RecordingRenderer();
         VertexPipeline.drawArrays(shader, exec, registers, memory, floatConstants,
                 VertexShaderInterpreter.embeddedIntConstants(exec), VertexShaderInterpreter.embeddedBoolConstants(exec),
-                new int[]{0, 1}, Screen.TOP, renderer);
+                new int[]{0, 1}, new FixedAttributes(), Screen.TOP, renderer);
 
         List<ShadedVertex> triangle = renderer.lastTriangles(Screen.TOP);
         assertEquals(3, triangle.size());
@@ -67,6 +67,8 @@ class VertexPipelineTest {
         int attr0 = 0x3 | (0x2 << 2); // FLOAT, 3 componentes
         int attr1 = 0x3 | (0x3 << 2); // FLOAT, 4 componentes
         registers.write(0x201, attr0 | (attr1 << 4), 0xF);
+        // 0x202 bits 28-31 = max_attribute_index: 2 atributos ativos (posição + cor).
+        registers.write(0x202, 1 << 28, 0xF);
         registers.write(0x203, 0, 0xF);
         registers.write(0x204, 0x10, 0xF); // comp0=atributo0, comp1=atributo1
         registers.write(0x205, (VERTEX_STRIDE_BYTES << 16) | (2 << 28), 0xF);

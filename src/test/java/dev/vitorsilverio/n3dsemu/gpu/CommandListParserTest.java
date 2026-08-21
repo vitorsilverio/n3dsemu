@@ -118,6 +118,25 @@ class CommandListParserTest {
         assertEquals(0xCCCCCCCC, registers.read(0x011E));
     }
 
+    @Test
+    void pulaAPalavraDePaddingQuandoAQuantidadeDePalavrasExtrasEImpar() {
+        PicaRegisters registers = new PicaRegisters();
+        // Comando 1: 1 palavra extra (total 3 palavras) -> o hardware exige padding até 8 bytes,
+        // então uma 4ª palavra de enchimento segue. Sem pulá-la, o parser leria o enchimento como
+        // parâmetro do comando 2 e desalinharia o resto da lista inteira.
+        int[] words = {
+                0x11111111, header(0x040, 0xF, 1, false),
+                0x22222222,
+                0xDEADBEEF, // padding
+                0x33333333, header(0x041, 0xF, 0, false),
+        };
+
+        CommandListParser.parse(words, registers);
+
+        assertEquals(0x22222222, registers.read(0x040));
+        assertEquals(0x33333333, registers.read(0x041));
+    }
+
     private static int header(int registerId, int byteMask, int extraCount, boolean consecutive) {
         int value = (registerId & 0xFFFF) | ((byteMask & 0xF) << 16) | ((extraCount & 0xFF) << 20);
         if (consecutive) {

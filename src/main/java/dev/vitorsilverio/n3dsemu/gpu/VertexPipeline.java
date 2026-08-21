@@ -25,8 +25,8 @@ public final class VertexPipeline {
 
     public static void drawArrays(ShaderBinary shader, ShaderBinary.Executable executable, PicaRegisters registers,
                                    AddressSpace memory, float[][] floatConstants, int[][] intConstants,
-                                   boolean[] boolConstants, int[] attributeToInputRegister, Screen screen,
-                                   PicaRenderer renderer) {
+                                   boolean[] boolConstants, int[] attributeToInputRegister, FixedAttributes fixedAttributes,
+                                   Screen screen, PicaRenderer renderer) {
         VertexAttributeLoader loader = new VertexAttributeLoader(registers);
         int offset = loader.vertexOffset();
         int count = loader.numVertices();
@@ -35,13 +35,13 @@ public final class VertexPipeline {
             indices.add(offset + i);
         }
         draw(shader, executable, loader, memory, floatConstants, intConstants, boolConstants,
-                attributeToInputRegister, indices, screen, renderer);
+                attributeToInputRegister, fixedAttributes, indices, screen, renderer);
     }
 
     public static void drawElements(ShaderBinary shader, ShaderBinary.Executable executable, PicaRegisters registers,
                                      AddressSpace memory, float[][] floatConstants, int[][] intConstants,
-                                     boolean[] boolConstants, int[] attributeToInputRegister, Screen screen,
-                                     PicaRenderer renderer) {
+                                     boolean[] boolConstants, int[] attributeToInputRegister, FixedAttributes fixedAttributes,
+                                     Screen screen, PicaRenderer renderer) {
         VertexAttributeLoader loader = new VertexAttributeLoader(registers);
         int count = loader.numVertices();
         List<Integer> indices = new ArrayList<>(count);
@@ -49,13 +49,13 @@ public final class VertexPipeline {
             indices.add(loader.readIndex(memory, i));
         }
         draw(shader, executable, loader, memory, floatConstants, intConstants, boolConstants,
-                attributeToInputRegister, indices, screen, renderer);
+                attributeToInputRegister, fixedAttributes, indices, screen, renderer);
     }
 
     private static void draw(ShaderBinary shader, ShaderBinary.Executable executable, VertexAttributeLoader loader,
                               AddressSpace memory, float[][] floatConstants, int[][] intConstants,
-                              boolean[] boolConstants, int[] attributeToInputRegister, List<Integer> vertexIndices,
-                              Screen screen, PicaRenderer renderer) {
+                              boolean[] boolConstants, int[] attributeToInputRegister, FixedAttributes fixedAttributes,
+                              List<Integer> vertexIndices, Screen screen, PicaRenderer renderer) {
         ShaderBinary.OutputRegister position = findOutput(executable, ShaderBinary.OutputRegister.SEMANTIC_POSITION);
         ShaderBinary.OutputRegister color = findOutput(executable, ShaderBinary.OutputRegister.SEMANTIC_COLOR);
 
@@ -63,8 +63,15 @@ public final class VertexPipeline {
         for (int vertexIndex : vertexIndices) {
             float[][] attributes = loader.load(memory, vertexIndex);
             float[][] input = new float[VertexShaderInterpreter.NUM_INPUT_REGISTERS][4];
-            for (int attributeId = 0; attributeId < attributeToInputRegister.length; attributeId++) {
-                input[attributeToInputRegister[attributeId]] = attributes[attributeId];
+            int activeAttributes = Math.min(loader.numAttributes(), attributeToInputRegister.length);
+            for (int attributeId = 0; attributeId < activeAttributes; attributeId++) {
+                // Um atributo sem *loader* de array é FIXO: o valor vem dos registradores
+                // `GPUREG_FIXEDATTRIB_*`, não da memória (achado real da G5.2 — a cor de
+                // `simple_tri` é um atributo fixo branco, e sem este caminho o triângulo saía
+                // preto/transparente, indistinguível de "não desenhou").
+                input[attributeToInputRegister[attributeId]] = loader.isLoadedFromArray(attributeId)
+                        ? attributes[attributeId]
+                        : fixedAttributes.value(attributeId);
             }
 
             float[][] output = VertexShaderInterpreter.run(shader, executable.mainOffset(), input, floatConstants,

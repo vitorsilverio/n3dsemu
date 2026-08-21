@@ -6,11 +6,20 @@ package dev.vitorsilverio.n3dsemu.gpu;
 /// float): esses registradores TÊM o mesmo `registerId` a cada escrita da rajada, então
 /// {@link PicaRegisters#write} sozinho (que só guarda o último valor) perde a sequência —
 /// precisa de alguém olhando escrita a escrita, não só o estado final.
-@FunctionalInterface
 public interface RegisterWriteListener {
     /// Nenhuma observação (RFC/task: comportamento de antes desta PR, quando só
     /// {@link PicaRegisters} importava).
     RegisterWriteListener NONE = (registerId, value, byteMask) -> { };
 
     void onWrite(int registerId, int value, int byteMask);
+
+    /// Encadeia vários observadores numa única passada da lista de comandos (ex.: o upload de
+    /// shader e a captura de atributos fixos, que olham faixas de registrador diferentes).
+    static RegisterWriteListener all(RegisterWriteListener... listeners) {
+        return (registerId, value, byteMask) -> {
+            for (RegisterWriteListener listener : listeners) {
+                listener.onWrite(registerId, value, byteMask);
+            }
+        };
+    }
 }

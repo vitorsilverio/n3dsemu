@@ -105,7 +105,10 @@ public final class VulkanRenderer implements PicaRenderer {
     private int currentFrame;
 
     private final Map<Screen, ScreenTexture> textures = new EnumMap<>(Screen.class);
-    private final Map<Screen, List<ShadedVertex>> pendingTriangles = new EnumMap<>(Screen.class);
+    /// Última geometria entregue por tela (RFC-N3DSEMU G5). PERSISTE entre quadros: é o conteúdo
+    /// corrente do *color buffer* daquela tela, redesenhado a cada apresentação até a lista de
+    /// comandos seguinte substituí-lo.
+    private final Map<Screen, List<ShadedVertex>> screenGeometry = new EnumMap<>(Screen.class);
     /// Recursos (ex.: *vertex buffers* descartáveis de {@link #drawPendingTriangles}) só podem
     /// ser liberados depois que a GPU terminar de usá-los — um balde por *frame in flight*,
     /// esvaziado logo após {@code vkWaitForFences} confirmar que aquele *slot* está livre de
@@ -217,11 +220,20 @@ public final class VulkanRenderer implements PicaRenderer {
 
     @Override
     public void drawTriangles(Screen screen, List<ShadedVertex> vertices) {
-        pendingTriangles.put(screen, List.copyOf(vertices));
+        screenGeometry.put(screen, List.copyOf(vertices));
     }
 
     @Override
     public void presentScreen(Screen screen, byte[] pixels, PixelFormat format, int stride) {
+        if (screenGeometry.containsKey(screen)) {
+            // A tela é desenhada pela PICA200, não pelo framebuffer do guest. O caminho que levaria
+            // a geometria renderizada de volta ao framebuffer em VRAM é o `DisplayTransfer`
+            // (`GX_DisplayTransfer`), que este HLE ainda não executa de verdade — então o
+            // framebuffer do guest fica ZERADO e, se fosse enviado assim, sobrescreveria o
+            // triângulo com preto a cada quadro (achado real da G5.2: o triângulo "piscava" e
+            // sumia). Enquanto houver geometria para esta tela, o framebuffer do guest é ignorado.
+            return;
+        }
         textures.get(screen).pendingRgba8 = FrameBufferCodec.decodeToRgba8(pixels, screen, format, stride);
     }
 
@@ -718,7 +730,7 @@ public final class VulkanRenderer implements PicaRenderer {
     }
 
     private void drawPendingTriangles(VkCommandBuffer commandBuffer, MemoryStack stack) {
-        for (Map.Entry<Screen, List<ShadedVertex>> entry : pendingTriangles.entrySet()) {
+        for (Map.Entry<Screen, List<ShadedVertex>> entry : screenGeometry.entrySet()) {
             ScreenTexture texture = textures.get(entry.getKey());
             List<ShadedVertex> vertices = entry.getValue();
             if (vertices.isEmpty()) {
@@ -763,7 +775,10 @@ public final class VulkanRenderer implements PicaRenderer {
             });
             texture.everUploaded = true;
         }
-        pendingTriangles.clear();
+        // A geometria NÃO é descartada depois de desenhada: ela é o conteúdo persistente da tela
+        // (o `color buffer` da PICA200 real também sobrevive até o próximo `MemoryFill`/desenho).
+        // Descartá-la fazia o triângulo aparecer só no quadro em que a lista de comandos chegava e
+        // sumir nos seguintes — o "flash" observado na validação da G5.
     }
 
     private long[] uploadGeometryVertexBuffer(List<ShadedVertex> vertices, MemoryStack stack) {

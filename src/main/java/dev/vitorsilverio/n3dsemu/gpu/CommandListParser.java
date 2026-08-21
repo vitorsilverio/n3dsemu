@@ -57,6 +57,16 @@ public final class CommandListParser {
                 registers.write(targetRegisterId, words[i], byteMask);
                 listener.onWrite(targetRegisterId, words[i], byteMask);
             }
+            if ((extraCount & 1) != 0) {
+                // 3dbrew ("GPU/Internal Registers", formato do comando): TODO comando ocupa um
+                // múltiplo de 8 bytes. Um comando tem `2 + extraCount` palavras, então uma
+                // quantidade ÍMPAR de palavras extras leva uma palavra de padding no fim. Sem
+                // pular esse padding, o parser lia a palavra de enchimento como o parâmetro do
+                // comando seguinte e todo o resto da lista saía desalinhado (achado real da G5.2:
+                // a lista do `simple_tri` morria com "registrador PICA200 fora do intervalo:
+                // 0xe000" — um cabeçalho lido em cima do lugar errado).
+                i++;
+            }
         }
     }
 }

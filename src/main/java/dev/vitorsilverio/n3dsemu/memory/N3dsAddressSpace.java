@@ -30,6 +30,21 @@ public final class N3dsAddressSpace {
         memory.mapRam(MemoryMap.TLS_BASE, new byte[MemoryMap.TLS_REGION_SIZE]);
         memory.mapRam(MemoryMap.FCRAM_BASE, new byte[MemoryMap.FCRAM_SIZE]);
 
+        // ── aliases virtual↔físico exigidos pela GPU (achado real da G5.2) ────────────────────
+        // A CPU do guest usa endereços VIRTUAIS; os registradores internos da PICA200 (endereço
+        // base de atributos de vértice, color/depth buffer, texturas) guardam endereços FÍSICOS,
+        // convertidos pelo próprio app com `osConvertVirtToPhys` (libctru `os.c`/`os.h`, valores
+        // literais conferidos: VRAM `0x1F000000`→`0x18000000`; heap linear antigo
+        // `0x14000000`→`0x20000000`). Como o hardware real acessa a MESMA memória pelos dois
+        // endereços, espelhar as páginas é mais fiel — e mais simples — do que traduzir endereço a
+        // endereço em cada consumidor da GPU. Sem isto, o `simple_tri` desenhava um triângulo com
+        // todos os atributos zerados (a GPU lia `0x20xxxxxx`, uma região com backing PRÓPRIO, em
+        // vez do buffer de vértices que o app escreveu em `0x14xxxxxx`) e o app escrevia no
+        // framebuffer de VRAM em `0x1F000000`, endereço que sequer estava no mapa (barramento
+        // aberto).
+        memory.mapMirror(MemoryMap.VRAM_VIRTUAL_BASE, MemoryMap.VRAM_BASE, MemoryMap.VRAM_SIZE);
+        memory.mapMirror(MemoryMap.FCRAM_BASE, MemoryMap.LINEAR_HEAP_BASE, MemoryMap.LINEAR_HEAP_SIZE);
+
         return memory;
     }
 

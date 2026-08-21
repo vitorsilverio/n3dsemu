@@ -22,12 +22,12 @@ import java.util.List;
 /// tabela granular por componente (24 valores de semântica, um por componente de saída) fica para
 /// quando um consumidor real precisar de uma ordem diferente.
 ///
-/// **Simplificação documentada desta PR**: só o modo **float32** do upload de uniforms
-/// (`GPUREG_VS_FLOATUNIFORM_CONFIG` bit 31 = 1, 4 palavras IEEE754 por constante) é suportado — o
-/// modo float24 empacotado (3 palavras/constante, bits cruzando fronteiras de palavra) não pôde
-/// ser validado contra um upload real nesta sessão (sem GPU disponível, RFC D4) e lança
-/// {@link UnsupportedOperationException} se encontrado, em vez de arriscar decodificar errado
-/// silenciosamente (mesma postura de `VertexShaderInterpreter` para opcodes fora do escopo).
+/// **Uniforms float (G5.2)**: os DOIS modos de `GPUREG_VS_FLOATUNIFORM_CONFIG` são suportados —
+/// float32 (bit 31 = 1, 4 palavras IEEE754 por constante) e float24 empacotado (3 palavras por
+/// constante). Em ambos os casos **a ordem dos componentes é invertida** (`w`,`z`,`y`,`x`): a
+/// primeira palavra do FIFO carrega o `w`. O `picasso` sobe as constantes embutidas do `.shbin` em
+/// float24 e o `citro3d` sobe os uniforms do app em float32, então `simple_tri` exercita os dois
+/// caminhos num único quadro.
 public final class ShaderUpload implements RegisterWriteListener {
     /// `GPUREG_VS_BOOLUNIFORM`.
     public static final int REG_BOOL_UNIFORM = 0x2B0;
@@ -36,6 +36,7 @@ public final class ShaderUpload implements RegisterWriteListener {
     private static final int NUM_INT_UNIFORMS = 4;
     /// `GPUREG_VS_ENTRYPOINT`.
     public static final int REG_ENTRYPOINT = 0x2BA;
+    private static final int ENTRYPOINT_OFFSET_MASK = 0xFFFF;
     /// `GPUREG_VS_ATTRIBUTES_PERMUTATION_LOW`/`HIGH`.
     public static final int REG_ATTRIBUTES_PERMUTATION_LOW = 0x2BB;
     public static final int REG_ATTRIBUTES_PERMUTATION_HIGH = 0x2BC;
@@ -45,6 +46,7 @@ public final class ShaderUpload implements RegisterWriteListener {
     private static final int REG_FLOAT_UNIFORM_DATA_LAST = 0x2C8;
     private static final int FLOAT_UNIFORM_MODE_32_BIT = 1 << 31;
     private static final int WORDS_PER_FLOAT32_CONSTANT = 4;
+    private static final int WORDS_PER_FLOAT24_CONSTANT = 3;
     /// `GPUREG_VS_CODETRANSFER_INDEX`.
     public static final int REG_CODETRANSFER_INDEX = 0x2CB;
     private static final int REG_CODETRANSFER_DATA_FIRST = 0x2CC;
@@ -99,7 +101,11 @@ public final class ShaderUpload implements RegisterWriteListener {
         } else if (registerId >= REG_FLOAT_UNIFORM_DATA_FIRST && registerId <= REG_FLOAT_UNIFORM_DATA_LAST) {
             onFloatUniformWord(value);
         } else if (registerId == REG_ENTRYPOINT) {
-            mainOffset = value;
+            // 3dbrew (`GPUREG_VS_ENTRYPOINT`): o valor escrito é `0x7FFF0000 | offset` — só os 16
+            // bits BAIXOS são o ponto de entrada. Guardar a palavra inteira fazia o interpretador
+            // começar a executar em `0x7FFF0000`, fora da memória de programa: o shader nunca
+            // rodava e todo vértice saía zerado (achado real da G5.2).
+            mainOffset = value & ENTRYPOINT_OFFSET_MASK;
         } else if (registerId == REG_ATTRIBUTES_PERMUTATION_LOW) {
             decodeAttributePermutation(value, 0, 8);
         } else if (registerId == REG_ATTRIBUTES_PERMUTATION_HIGH) {
@@ -121,23 +127,48 @@ public final class ShaderUpload implements RegisterWriteListener {
     }
 
     private void onFloatUniformWord(int word) {
-        if (!floatUniformMode32) {
-            throw new UnsupportedOperationException(
-                    "upload de uniform float em modo float24 (empacotado) não implementado nesta PR — "
-                            + "ver Javadoc de ShaderUpload");
-        }
+        int wordsPerConstant = floatUniformMode32 ? WORDS_PER_FLOAT32_CONSTANT : WORDS_PER_FLOAT24_CONSTANT;
         floatUniformPendingWords.add(word);
-        if (floatUniformPendingWords.size() == WORDS_PER_FLOAT32_CONSTANT) {
-            if (floatUniformIndex < floatConstants.length) {
-                floatConstants[floatUniformIndex] = new float[]{
-                        Float.intBitsToFloat(floatUniformPendingWords.get(0)),
-                        Float.intBitsToFloat(floatUniformPendingWords.get(1)),
-                        Float.intBitsToFloat(floatUniformPendingWords.get(2)),
-                        Float.intBitsToFloat(floatUniformPendingWords.get(3))};
-            }
-            floatUniformIndex++;
-            floatUniformPendingWords.clear();
+        if (floatUniformPendingWords.size() < wordsPerConstant) {
+            return;
         }
+        if (floatUniformIndex < floatConstants.length) {
+            floatConstants[floatUniformIndex] = floatUniformMode32
+                    ? decodeFloat32Constant(floatUniformPendingWords)
+                    : decodeFloat24Constant(floatUniformPendingWords);
+        }
+        floatUniformIndex++;
+        floatUniformPendingWords.clear();
+    }
+
+    /// **A ordem dos componentes é INVERTIDA** (`w`,`z`,`y`,`x`), igual ao modo float24 — a
+    /// primeira palavra escrita no FIFO é o `w`. Confirmado contra a matriz real que o
+    /// `simple_tri` sobe (`Mtx_OrthoTilt(0,400,0,240,0,1,true)`): lida na ordem direta, a primeira
+    /// linha saía `(-1, 0, 1/120, 0)`; invertida, sai `(0, 1/120, 0, -1)`, que é exatamente a
+    /// linha `x' = 2/(top-bottom)*y - 1` da ortográfica inclinada do 3DS. Sem a inversão o
+    /// triângulo era projetado com `w = 0` e todo vértice virava `NaN`.
+    private static float[] decodeFloat32Constant(List<Integer> words) {
+        return new float[]{
+                Float.intBitsToFloat(words.get(3)),
+                Float.intBitsToFloat(words.get(2)),
+                Float.intBitsToFloat(words.get(1)),
+                Float.intBitsToFloat(words.get(0))};
+    }
+
+    /// Modo float24 empacotado: 4 componentes de 24 bits espremidos em 3 palavras de 32 bits, na
+    /// ordem `w`,`z`,`y`,`x` (o componente `w` ocupa os 24 bits ALTOS da primeira palavra e `x` os
+    /// 24 bits baixos da terceira). Layout transcrito do `Pica::Regs` real do Citra
+    /// (`video_core/pica.cpp`, tratamento de `vs_uniform_setup`) — é o modo que o `citro3d` usa por
+    /// padrão (`C3D_FVUnifMtx4x4`), então sem ele NENHUM app de citro3d chega a desenhar.
+    private static float[] decodeFloat24Constant(List<Integer> words) {
+        int w0 = words.get(0);
+        int w1 = words.get(1);
+        int w2 = words.get(2);
+        float w = Float24.decode(w0 >>> 8);
+        float z = Float24.decode(((w0 & 0xFF) << 16) | ((w1 >>> 16) & 0xFFFF));
+        float y = Float24.decode(((w1 & 0xFFFF) << 8) | ((w2 >>> 24) & 0xFF));
+        float x = Float24.decode(w2 & 0xFFFFFF);
+        return new float[]{x, y, z, w};
     }
 
     /// Convenção universal do `picasso`/`citro3d` (ver Javadoc da classe): `o0`=posição (`xyzw`),
