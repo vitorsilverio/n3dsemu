@@ -2,6 +2,7 @@ package dev.vitorsilverio.n3dsemu.service;
 
 import dev.vitorsilverio.armjitter.memory.PagedAddressSpace;
 import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
+import dev.vitorsilverio.n3dsemu.gpu.GxCommandQueue;
 import dev.vitorsilverio.n3dsemu.gpu.PicaRegisters;
 import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
 import dev.vitorsilverio.n3dsemu.gpu.RecordingRenderer;
@@ -318,5 +319,19 @@ class GspGpuServiceTest {
         // commandIndex avançou (a fila não fica "presa" reprocessando a mesma entrada) e o evento
         // P3D foi sinalizado — sem isso, `gxCmdQueueWait`/`gspWaitForEvent` do guest travaria.
         assertEquals(1, memory.read8(queueBase) & 0xFF);
+
+        // Investigação G5.1 (2026-08-21): confirma que a entrega do evento P3D (id=5, "Command
+        // list processing finished" — GSPGPU_Event real, ver Javadoc de GxCommandQueue) para a
+        // FILA DE INTERRUPÇÃO é exatamente a mesma mecânica já provada correta para VBlank/PDC0
+        // pela G3.3 — isola se o travamento do 2º frame de `simple_tri` (usuário: "tela fica preta
+        // e continua aberta" depois de um flash raro do triângulo) vem da entrega HOST->guest do
+        // evento ou de outro lugar (provavelmente lógica do próprio app/citro3d após C3D_FrameBegin
+        // retornar, ainda não rastreada — ver `## Objetivo` no arquivo da task).
+        int interruptCountOffset = 0x1;
+        int interruptEntriesOffset = 0xC;
+        assertEquals(1, memory.read8(SHARED_MEMORY_ADDRESS + interruptCountOffset) & 0xFF,
+                "esperava exatamente 1 interrupção enfileirada (P3D) apos o TriggerCmdReqQueue");
+        assertEquals(GxCommandQueue.EVENT_P3D, memory.read8(SHARED_MEMORY_ADDRESS + interruptEntriesOffset) & 0xFF,
+                "esperava o evento enfileirado ser P3D (5), nao outro tipo");
     }
 }

@@ -141,16 +141,35 @@ public final class Scheduler {
     /// principal, cujo {@code savedContext} continua `null` até a primeira vez que ELA for
     /// trocada para fora de verdade) e carrega o de `next`, atualizando `CP15.TPIDRURO` (RFC
     /// §3: TLS por thread).
+    ///
+    /// **Achado real (G5.1)**: {@link ArmCore#loadState} restaura {@code cycles} como parte do
+    /// snapshot de UMA thread (correto para save-state real de CPU única) — mas aqui um único
+    /// `ArmCore` é multiplexado entre VÁRIAS threads cooperativas que precisam enxergar o MESMO
+    /// relógio virtual (ver {@link #currentTick}). Sem preservar `cycles` através da troca, cada
+    /// `restoreContext` fazia o relógio "voltar no tempo" para o valor que a thread alvo tinha da
+    /// ÚLTIMA vez que rodou — a thread principal do `simple_tri.3dsx` nunca enxergava o tempo
+    /// real avançar entre retomadas (sempre ~120-145 ciclos, o próprio corpo do laço, nunca o
+    /// período de VBlank inteiro que a thread de relay via) e por isso nunca completava a espera
+    /// que precede o primeiro `GSPGPU_TriggerCmdReqQueue` — confirmado com um trace temporário de
+    /// `currentTick()` a cada troca (revertido, não commitado): a sequência de retomadas da
+    /// thread principal ficava presa em ~4,48M-6,82M ciclos por 19 mil trocas, enquanto a thread
+    /// de relay (que sempre parte do seu próprio snapshot recém-salvo, nunca de um antigo já
+    /// obsoleto) via o relógio real chegar a 87 bilhões. Fix: capturar o relógio compartilhado
+    /// ANTES da troca e reafirmá-lo com {@link ArmCore#setCycles} depois de qualquer
+    /// `restoreContext` — o cold-start (thread nova) não precisa disso, `configureExecutionState`
+    /// não toca `cycles`.
     private void switchTo(ThreadObject next) {
         if (current == next) {
             next.setState(ThreadObject.State.RUNNING);
             return;
         }
+        long sharedCycles = core.cycles();
         if (current != null) {
             current.setSavedContext(captureContext());
         }
         if (next.started()) {
             restoreContext(next.savedContext());
+            core.setCycles(sharedCycles);
         } else {
             core.configureExecutionState(next.entryPoint(), CpuMode.USER, InstructionSet.ARM, false, false);
             core.setRegister(REGISTER_SP, next.initialStackTop());
