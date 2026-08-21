@@ -12,18 +12,69 @@ public final class RecordingRenderer implements PicaRenderer {
     private final Map<Screen, byte[]> lastRgba8 = new EnumMap<>(Screen.class);
     private final Map<Screen, java.util.List<ShadedVertex>> lastTriangles = new EnumMap<>(Screen.class);
     private final Map<Screen, float[]> lastClearColor = new EnumMap<>(Screen.class);
+    private final PicaTexture[] textures = new PicaTexture[TextureUnits.UNIT_COUNT];
+    private dev.vitorsilverio.n3dsemu.gpu.tev.TevConfig tevConfig;
     private int frameCount;
+    private int drawCallCount;
+    private int vertexCount;
     private boolean closed;
 
     @Override
     public void drawTriangles(Screen screen, java.util.List<ShadedVertex> vertices) {
         lastTriangles.put(screen, java.util.List.copyOf(vertices));
+        drawCallCount++;
+        vertexCount += vertices.size();
+    }
+
+    /// Resumo do que a GPU emulada produziu — usado pelo `--report` do `Main` para levantar, sem
+    /// GPU nem olho humano, quão longe cada exemplo chega (RFC/task G5: a tabela dos 20 exemplos
+    /// de `graphics/gpu` é item de aceite).
+    public String report() {
+        StringBuilder summary = new StringBuilder();
+        summary.append("desenhos=").append(drawCallCount)
+                .append(" vertices=").append(vertexCount)
+                .append(" quadros=").append(frameCount);
+        for (Screen screen : Screen.values()) {
+            float[] clear = lastClearColor.get(screen);
+            if (clear != null) {
+                summary.append(' ').append(screen).append("-fundo=#")
+                        .append(String.format("%02X%02X%02X", (int) (clear[0] * 255), (int) (clear[1] * 255),
+                                (int) (clear[2] * 255)));
+            }
+        }
+        for (int unit = 0; unit < textures.length; unit++) {
+            if (textures[unit] != null) {
+                summary.append(" tex").append(unit).append('=')
+                        .append(textures[unit].width()).append('x').append(textures[unit].height());
+            }
+        }
+        return summary.toString();
     }
 
     /// Última lista de triângulos recebida para `screen` (RFC G5/PR2), ou `null` se
     /// {@link #drawTriangles} nunca foi chamado para essa tela.
     public java.util.List<ShadedVertex> lastTriangles(Screen screen) {
         return lastTriangles.get(screen);
+    }
+
+    @Override
+    public void setTevConfig(dev.vitorsilverio.n3dsemu.gpu.tev.TevConfig config) {
+        this.tevConfig = config;
+    }
+
+    /// Última {@link dev.vitorsilverio.n3dsemu.gpu.tev.TevConfig} recebida, ou `null`.
+    public dev.vitorsilverio.n3dsemu.gpu.tev.TevConfig tevConfig() {
+        return tevConfig;
+    }
+
+    @Override
+    public void setTexture(int unit, PicaTexture texture) {
+        textures[unit] = texture;
+    }
+
+    /// Última textura recebida na unidade `unit`, ou `null`.
+    public PicaTexture texture(int unit) {
+        return textures[unit];
     }
 
     @Override

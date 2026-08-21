@@ -40,6 +40,12 @@ public final class VertexAttributeLoader {
         this.registers = registers;
     }
 
+    /// Banco de registradores de onde este loader lê — exposto para quem precisa de outra view
+    /// tipada do MESMO estado no mesmo desenho (ex.: {@link OutputMap}).
+    public PicaRegisters registers() {
+        return registers;
+    }
+
     public long baseAddress() {
         long base = (registers.read(REG_BASE_ADDRESS) >>> 1) & 0xFFFFFFFL;
         return base * 16L;

@@ -4,6 +4,7 @@ import dev.vitorsilverio.armjitter.memory.AddressSpace;
 import dev.vitorsilverio.n3dsemu.gpu.FrameBufferState;
 import dev.vitorsilverio.n3dsemu.gpu.GuestFrameBufferReader;
 import dev.vitorsilverio.n3dsemu.gpu.PicaRenderer;
+import dev.vitorsilverio.n3dsemu.gpu.RecordingRenderer;
 import dev.vitorsilverio.n3dsemu.gpu.Screen;
 import dev.vitorsilverio.n3dsemu.gpu.vulkan.VulkanRenderer;
 import dev.vitorsilverio.n3dsemu.input.InputScript;
@@ -25,7 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.lwjgl.glfw.GLFW.*;
 
 /// CLI do n3dsemu: `n3dsemu [--headless] [--interp|--check] [--slices=N] [--trace-svc]
-/// [--script=<arquivo>] <arquivo.3dsx>`.
+/// [--report] [--script=<arquivo>] <arquivo.3dsx>`.
 ///
 /// **Modo janela é o default** (RFC-N3DSEMU G4 — Vulkan/LWJGL/GLFW, RFC D4: sem backend de
 /// software). `--headless` preserva o comportamento da G3: nenhuma janela, executa
@@ -78,6 +79,7 @@ public final class Main {
         int sliceCount = DEFAULT_SLICE_COUNT;
         boolean traceSvc = false;
         boolean headless = false;
+        boolean report = false;
         InputScript inputScript = null;
         int index = 0;
         while (index < args.length && args[index].startsWith("--")) {
@@ -92,6 +94,10 @@ public final class Main {
                     case "--check" -> backend = N3dsMachine.Backend.CHECK;
                     case "--trace-svc" -> traceSvc = true;
                     case "--headless" -> headless = true;
+                    case "--report" -> {
+                        headless = true;
+                        report = true;
+                    }
                     default -> {
                         usage();
                         return;
@@ -119,8 +125,9 @@ public final class Main {
             // RFC-N3DSEMU G5/PR3: sem renderer real (`null`) — o headless/CI não tem GPU/driver
             // Vulkan (RFC D4), a GPU continua sendo interpretada/contada mas nada é desenhado,
             // mesmo comportamento de antes desta PR.
-            N3dsMachine machine = N3dsMachine.create(image, backend, System.out, traceSvc, inputScript, null);
-            runHeadless(machine, sliceCount);
+            RecordingRenderer recorder = report ? new RecordingRenderer() : null;
+            N3dsMachine machine = N3dsMachine.create(image, backend, System.out, traceSvc, inputScript, recorder);
+            runHeadless(machine, sliceCount, recorder);
         } else {
             runWindowed(image, backend, traceSvc, inputScript);
         }
@@ -236,7 +243,17 @@ public final class Main {
     }
 
     /// Modo `--headless` (comportamento da G3, preservado — usado por CI/testes automatizados).
-    private static void runHeadless(N3dsMachine machine, int sliceCount) {
+    /// Modo `--report`: como `--headless`, mas com um {@link RecordingRenderer} no lugar da GPU —
+    /// ao final imprime um resumo do que a GPU emulada produziu (quantos desenhos, quantos
+    /// vértices, cor de fundo, texturas ligadas). É como o levantamento dos exemplos de
+    /// `graphics/gpu` é feito sem GPU nem olho humano (RFC/task G5).
+    private static void printReport(RecordingRenderer recorder) {
+        if (recorder != null) {
+            System.out.println("n3dsemu-report: " + recorder.report());
+        }
+    }
+
+    private static void runHeadless(N3dsMachine machine, int sliceCount, RecordingRenderer recorder) {
         for (int i = 0; i < sliceCount; i++) {
             try {
                 machine.runSlice();
@@ -266,6 +283,7 @@ public final class Main {
                 // o que foi observado até aqui e sai com o mesmo código — não é um crash do
                 // `n3dsemu`, é o guest indo além do que o esqueleto HLE consegue sustentar.
                 printTrace(machine.svcTable().recentCalls());
+                printReport(recorder);
                 System.err.println("n3dsemu: parou de progredir após a última svc acima ("
                         + e.getClass().getSimpleName() + ": " + e.getMessage() + ")");
                 System.exit(EXIT_NO_SVC_IMPLEMENTED);
@@ -273,6 +291,7 @@ public final class Main {
             }
         }
         printTrace(machine.svcTable().recentCalls());
+        printReport(recorder);
         System.exit(EXIT_NO_SVC_IMPLEMENTED);
     }
 
@@ -286,7 +305,7 @@ public final class Main {
 
     private static void usage() {
         System.err.println("uso: n3dsemu [--headless] [--interp|--check] [--slices=N] [--trace-svc] "
-                + "[--script=<arquivo>] <arquivo.3dsx>");
+                + "[--report] [--script=<arquivo>] <arquivo.3dsx>");
         System.exit(EXIT_USAGE_ERROR);
     }
 }

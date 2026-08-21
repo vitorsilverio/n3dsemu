@@ -6,6 +6,7 @@ import dev.vitorsilverio.n3dsemu.gpu.GxCommandQueue;
 import dev.vitorsilverio.n3dsemu.gpu.PicaRegisters;
 import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
 import dev.vitorsilverio.n3dsemu.gpu.RecordingRenderer;
+import dev.vitorsilverio.n3dsemu.gpu.tev.TevConfig;
 import dev.vitorsilverio.n3dsemu.gpu.Screen;
 import dev.vitorsilverio.n3dsemu.gpu.ShadedVertex;
 import dev.vitorsilverio.n3dsemu.gpu.shader.ShaderUpload;
@@ -30,6 +31,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -183,6 +186,7 @@ class GspGpuServiceTest {
     private static final int CMD_TRIGGER_CMD_REQ_QUEUE = 0xC;
     private static final int COMMAND_LIST_ADDRESS = 0x1400_0000;
     private static final int VERTEX_DATA_ADDRESS = 0x1400_1000;
+    private static final int TEXTURE_ADDRESS = 0x1800_0000;
     private static final int GX_QUEUE_OFFSET = 0x800;
 
     /// Monta a lista de comandos PICA200 crua que um app real produziria para desenhar um único
@@ -251,6 +255,92 @@ class GspGpuServiceTest {
         memory.write32(base + 20, Float.floatToIntBits(g));
         memory.write32(base + 24, Float.floatToIntBits(b));
         memory.write32(base + 28, Float.floatToIntBits(a));
+    }
+
+    /// **Cadeia completa de TEXTURA e TEV (RFC-N3DSEMU G5/PR4)**: uma lista de comandos que
+    /// habilita a unidade de textura 0, aponta para uma textura na memória do guest e programa um
+    /// estágio TEV `Modulate(PRIMARY_COLOR, TEXTURE0)` tem que chegar ao renderer como uma textura
+    /// já DESEMBARALHADA (ordem de blocos 8×8 de Morton) e uma `TevConfig` decodificada — é o que
+    /// determina o *fragment shader* gerado. Sem GPU: o `RecordingRenderer` guarda os dois.
+    @Test
+    void listaDeComandosComTexturaEntregaTexturaDecodificadaEConfiguracaoTevAoRenderer() {
+        PrintStream log = new PrintStream(new ByteArrayOutputStream());
+        PagedAddressSpace memory = new PagedAddressSpace(PAGE_SHIFT, new LoggingOpenBus(log));
+        memory.mapRam(BUFFER_ADDRESS & ~0xFFF, new byte[1 << PAGE_SHIFT]);
+        memory.mapRam(SHARED_MEMORY_ADDRESS, new byte[1 << PAGE_SHIFT]);
+        memory.mapRam(COMMAND_LIST_ADDRESS, new byte[1 << PAGE_SHIFT]);
+        memory.mapRam(VERTEX_DATA_ADDRESS, new byte[1 << PAGE_SHIFT]);
+        memory.mapRam(TEXTURE_ADDRESS, new byte[1 << PAGE_SHIFT]);
+        HandleTable handles = new HandleTable(new ProcessObject(0), ThreadObject.mainThread(1, 0x30));
+        Scheduler scheduler = new Scheduler();
+        HidService hid = new HidService(log, memory, handles, new InputState(), null);
+        RecordingRenderer renderer = new RecordingRenderer();
+        GspGpuService gsp = new GspGpuService(log, memory, handles, scheduler, hid, renderer);
+
+        int eventHandle = handles.create(new EventObject(ResetType.STICKY));
+        memory.write32(BUFFER_ADDRESS, IpcCommandHeader.pack(CMD_REGISTER_INTERRUPT_RELAY_QUEUE, 1, 2));
+        memory.write32(BUFFER_ADDRESS + 4, 0);
+        memory.write32(BUFFER_ADDRESS + 8, IpcCommandHeader.moveHandleDescriptor(1));
+        memory.write32(BUFFER_ADDRESS + 12, eventHandle);
+        gsp.handleRequest(new IpcRequest(memory, BUFFER_ADDRESS), new IpcResponse(memory, BUFFER_ADDRESS));
+        int memHandle = memory.read32(BUFFER_ADDRESS + 4 * 4);
+        MemoryBlockObject block = (MemoryBlockObject) handles.resolve(memHandle).orElseThrow();
+        block.bindHostBacking(SHARED_MEMORY_ADDRESS);
+
+        writeVertex(memory, 0, -0.5f, -0.5f, 0f, 1f, 1f, 0f, 0f, 1f);
+        writeVertex(memory, 1, 0.5f, -0.5f, 0f, 1f, 0f, 1f, 0f, 1f);
+        writeVertex(memory, 2, 0.0f, 0.5f, 0f, 1f, 0f, 0f, 1f, 1f);
+
+        // Texel vermelho opaco em (x=1,y=0) do bloco 8x8, gravado na posição de MORTON dele.
+        int texelBase = TEXTURE_ADDRESS + dev.vitorsilverio.n3dsemu.gpu.Texture.mortonIndexInTile(1, 0) * 4;
+        memory.write8(texelBase, 0xFF);       // A
+        memory.write8(texelBase + 1, 0x00);   // B
+        memory.write8(texelBase + 2, 0x00);   // G
+        memory.write8(texelBase + 3, 0xFF);   // R
+
+        List<Integer> extra = new ArrayList<>();
+        writeReg(extra, 0x080, 0b001);                       // GPUREG_TEXUNIT_CONFIG: unidade 0 ligada
+        writeReg(extra, 0x082, (8 << 16) | 8);               // 8x8
+        writeReg(extra, 0x085, TEXTURE_ADDRESS >>> 3);       // endereço físico >> 3
+        writeReg(extra, 0x08E, 0);                           // formato RGBA8
+        // TEV estágio 0: Modulate(PRIMARY_COLOR, TEXTURE0).
+        writeReg(extra, 0x0C0, 0 | (3 << 4));
+        writeReg(extra, 0x0C2, 1);                           // colorCombine = MODULATE
+
+        int[] base = buildSimpleTriCommandList();
+        int[] commandList = new int[extra.size() + base.length];
+        for (int i = 0; i < extra.size(); i++) {
+            commandList[i] = extra.get(i);
+        }
+        System.arraycopy(base, 0, commandList, extra.size(), base.length);
+        for (int i = 0; i < commandList.length; i++) {
+            memory.write32(COMMAND_LIST_ADDRESS + 4 * i, commandList[i]);
+        }
+
+        int queueBase = SHARED_MEMORY_ADDRESS + GX_QUEUE_OFFSET;
+        memory.write8(queueBase, 0);
+        memory.write8(queueBase + 1, 1);
+        int entryBase = queueBase + 0x20;
+        memory.write8(entryBase, 1);
+        memory.write32(entryBase + 4, COMMAND_LIST_ADDRESS);
+        memory.write32(entryBase + 8, commandList.length * 4);
+
+        memory.write32(BUFFER_ADDRESS, IpcCommandHeader.pack(CMD_TRIGGER_CMD_REQ_QUEUE, 0, 0));
+        gsp.handleRequest(new IpcRequest(memory, BUFFER_ADDRESS), new IpcResponse(memory, BUFFER_ADDRESS));
+
+        dev.vitorsilverio.n3dsemu.gpu.PicaTexture texture = renderer.texture(0);
+        assertNotNull(texture, "esperava a textura da unidade 0 entregue ao renderer");
+        assertEquals(8, texture.width());
+        assertEquals(8, texture.height());
+        // (1,0) vermelho: se o desembaralho de Morton estiver errado, o vermelho sai em (2,0).
+        assertEquals((byte) 0xFF, texture.rgba8()[1 * 4]);
+        assertEquals((byte) 0x00, texture.rgba8()[1 * 4 + 1]);
+        assertNull(renderer.texture(1), "unidade 1 desligada não deve entregar textura");
+
+        TevConfig tev = renderer.tevConfig();
+        assertNotNull(tev, "esperava a configuração TEV decodificada");
+        assertEquals(TevConfig.CombinerOp.MODULATE, tev.stages().get(0).colorCombine());
+        assertEquals(TevConfig.Source.TEXTURE0, tev.stages().get(0).colorSource().get(1));
     }
 
     /// **O teste-alvo desta PR (RFC-N3DSEMU G5/PR3)**: até aqui, `TriggerCmdReqQueue` só contava

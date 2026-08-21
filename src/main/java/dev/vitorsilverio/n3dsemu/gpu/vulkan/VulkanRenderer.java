@@ -15,9 +15,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
+import dev.vitorsilverio.n3dsemu.gpu.PicaTexture;
+import dev.vitorsilverio.n3dsemu.gpu.tev.TevConfig;
+import dev.vitorsilverio.n3dsemu.gpu.tev.TevGlslGenerator;
 import java.nio.LongBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -65,7 +70,16 @@ public final class VulkanRenderer implements PicaRenderer {
     private static final int PUSH_CONSTANT_SIZE_BYTES = 16;
 
     /// `vec2` posição NDC + `vec4` cor (RFC G5/PR2) — ver `shaders/triangle.vert`.
-    private static final int GEOMETRY_VERTEX_STRIDE_BYTES = 6 * Float.BYTES;
+    /// `vec2` posição NDC + `vec4` cor + 3× `vec2` coordenada de textura (RFC-N3DSEMU G5/PR4).
+    private static final int GEOMETRY_VERTEX_STRIDE_BYTES = 12 * Float.BYTES;
+    /// Unidades de textura amostráveis pelo GLSL gerado (`tex0`-`tex3`). O hardware tem 3 reais
+    /// (`TextureUnits.UNIT_COUNT`) + a procedural; a 4ª existe aqui só para o *binding* declarado
+    /// pelo gerador ter sempre um descritor válido.
+    private static final int TEXTURE_BINDING_COUNT = 4;
+    /// Teto de chamadas de desenho por quadro que o pool de descritores comporta. Excedentes são
+    /// descartadas com um aviso — preferível a estourar a alocação no meio da gravação do command
+    /// buffer (RFC/task G5: "correção primeiro", sem otimização).
+    private static final int MAX_DRAW_CALLS_PER_FRAME = 1024;
 
     private final long window;
     private final VkInstance instance;
@@ -87,8 +101,16 @@ public final class VulkanRenderer implements PicaRenderer {
     /// 100% do caminho de apresentação/rotação já validado na G4 (a MESMA textura que o *blit* da
     /// CPU alimenta), em vez de inventar um caminho paisagem paralelo. Ainda **sem TEV** (PR3).
     private final long geometryRenderPass;
+    private final long geometryLoadRenderPass;
     private final long geometryPipelineLayout;
-    private final long geometryPipeline;
+    private final long geometryDescriptorSetLayout;
+    /// Um pool por *frame in flight*: reciclado (`vkResetDescriptorPool`) logo depois que a cerca
+    /// daquele slot confirma que a GPU terminou de usar os descritores do quadro anterior.
+    private final long[] geometryDescriptorPools = new long[FRAMES_IN_FLIGHT];
+    /// Textura 1×1 branca para as unidades desligadas — o GLSL gerado declara sempre os 4
+    /// *bindings*, e um descritor não escrito é comportamento indefinido (a mesma classe de bug da
+    /// G4.2).
+    private final GuestTexture whiteTexture;
 
     private long swapchain;
     private int swapchainImageFormat;
@@ -108,10 +130,24 @@ public final class VulkanRenderer implements PicaRenderer {
     /// Última geometria entregue por tela (RFC-N3DSEMU G5). PERSISTE entre quadros: é o conteúdo
     /// corrente do *color buffer* daquela tela, redesenhado a cada apresentação até a lista de
     /// comandos seguinte substituí-lo.
-    private final Map<Screen, List<ShadedVertex>> screenGeometry = new EnumMap<>(Screen.class);
+    /// Chamadas de desenho por tela. Todas as que chegam entre duas apresentações são ACUMULADAS
+    /// (um quadro real emite várias — `particles`/`2d_shapes` desenham dezenas), e o conjunto
+    /// completo PERSISTE nos quadros seguintes: é o conteúdo corrente do *color buffer* daquela
+    /// tela, redesenhado até a próxima leva chegar.
+    private final Map<Screen, List<DrawCall>> screenGeometry = new EnumMap<>(Screen.class);
     /// Cor de fundo por tela (`GX_MemoryFill` do app, RFC G5.3) — o *load* do render pass de
     /// geometria. Preto até o primeiro `C3D_RenderTargetClear` do guest.
     private final Map<Screen, float[]> clearColors = new EnumMap<>(Screen.class);
+    /// Cache de *fragment shader* por configuração TEV (RFC/task G5: "compilar o mesmo shader duas
+    /// vezes é o erro clássico aqui — um `HashMap<TevConfig, VkShaderModule>` resolve"). O
+    /// pipeline inteiro é cacheado junto, porque trocar o módulo de fragmento exige um pipeline
+    /// novo.
+    private final Map<TevConfig, Long> tevPipelines = new HashMap<>();
+    private final GuestTexture[] textureUnits = new GuestTexture[TEXTURE_BINDING_COUNT];
+    private TevConfig currentTevConfig = TevConfig.passthroughPrimaryColor();
+    /// `true` quando um {@link #endFrame} aconteceu e o próximo {@link #drawTriangles} deve COMEÇAR
+    /// uma lista nova em vez de acumular — ver Javadoc de {@link #screenGeometry}.
+    private boolean geometryRestartPending = true;
     /// Recursos (ex.: *vertex buffers* descartáveis de {@link #drawPendingTriangles}) só podem
     /// ser liberados depois que a GPU terminar de usá-los — um balde por *frame in flight*,
     /// esvaziado logo após {@code vkWaitForFences} confirmar que aquele *slot* está livre de
@@ -120,6 +156,25 @@ public final class VulkanRenderer implements PicaRenderer {
     private static final float[] OPAQUE_BLACK = {0f, 0f, 0f, 1f};
     private boolean framebufferResized;
     private boolean closed;
+
+    /// Uma chamada de desenho completa: a geometria já sombreada mais o estado da GPU que
+    /// determina como pintá-la (configuração TEV + texturas ligadas no instante do desenho).
+    private record DrawCall(List<ShadedVertex> vertices, TevConfig tevConfig, GuestTexture[] textures) {
+    }
+
+    /// Uma textura do guest residente na GPU do hospedeiro. Recriada quando as dimensões mudam e
+    /// reenviada quando o conteúdo muda — comparado por hash, porque o guest reescreve a mesma
+    /// textura na mesma posição de memória a cada quadro sem que o conteúdo mude.
+    private final class GuestTexture {
+        int width;
+        int height;
+        int contentHash;
+        long image;
+        long imageMemory;
+        long imageView;
+        boolean everUploaded;
+        byte[] pendingRgba8;
+    }
 
     /// Recursos de uma tela: textura RETRATO (largura=`Screen.ROWS`, altura=`screen.columns()` —
     /// a rotação é feita no shader, nunca aqui) + buffer de staging persistente (mapeado uma vez)
@@ -138,6 +193,7 @@ public final class VulkanRenderer implements PicaRenderer {
         boolean everUploaded;
         byte[] pendingRgba8;
         long geometryFramebuffer;
+        long geometryLoadFramebuffer;
 
         ScreenTexture(int width, int height) {
             this.width = width;
@@ -184,15 +240,20 @@ public final class VulkanRenderer implements PicaRenderer {
             this.pipelineLayout = createPipelineLayout();
             this.renderPass = createRenderPass();
             this.sampler = createSampler();
-            this.geometryRenderPass = createGeometryRenderPass();
+            this.geometryRenderPass = createGeometryRenderPass(true);
+            this.geometryLoadRenderPass = createGeometryRenderPass(false);
+            this.geometryDescriptorSetLayout = createGeometryDescriptorSetLayout();
             this.geometryPipelineLayout = createGeometryPipelineLayout();
+            for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+                this.geometryDescriptorPools[i] = createGeometryDescriptorPool();
+            }
             createSwapchainAndDependents();
             createCommandBuffers();
             createSyncObjects();
             for (Screen screen : Screen.values()) {
                 textures.put(screen, createScreenTexture(screen));
             }
-            this.geometryPipeline = createGeometryPipeline();
+            this.whiteTexture = createWhiteTexture();
             this.frameCleanup = newFrameCleanupArray();
         } catch (VulkanUnavailableException e) {
             throw e;
@@ -224,7 +285,38 @@ public final class VulkanRenderer implements PicaRenderer {
 
     @Override
     public void drawTriangles(Screen screen, List<ShadedVertex> vertices) {
-        screenGeometry.put(screen, List.copyOf(vertices));
+        if (geometryRestartPending) {
+            screenGeometry.clear();
+            geometryRestartPending = false;
+        }
+        screenGeometry.computeIfAbsent(screen, unused -> new ArrayList<>())
+                .add(new DrawCall(List.copyOf(vertices), currentTevConfig, textureUnits.clone()));
+    }
+
+    @Override
+    public void setTevConfig(TevConfig config) {
+        this.currentTevConfig = config;
+    }
+
+    @Override
+    public void setTexture(int unit, PicaTexture texture) {
+        if (texture == null) {
+            textureUnits[unit] = null;
+            return;
+        }
+        GuestTexture resident = textureUnits[unit];
+        if (resident == null || resident.width != texture.width() || resident.height != texture.height()) {
+            if (resident != null) {
+                destroyGuestTexture(resident);
+            }
+            resident = createGuestTexture(texture.width(), texture.height());
+            textureUnits[unit] = resident;
+        }
+        int contentHash = Arrays.hashCode(texture.rgba8());
+        if (!resident.everUploaded || resident.contentHash != contentHash) {
+            resident.contentHash = contentHash;
+            resident.pendingRgba8 = texture.rgba8();
+        }
     }
 
     @Override
@@ -249,6 +341,8 @@ public final class VulkanRenderer implements PicaRenderer {
     @Override
     public void endFrame() {
         renderFrame();
+        // A próxima leva de desenhos começa um quadro novo (ver Javadoc de `screenGeometry`).
+        geometryRestartPending = true;
     }
 
     @Override
@@ -263,6 +357,7 @@ public final class VulkanRenderer implements PicaRenderer {
         }
         for (ScreenTexture texture : textures.values()) {
             vkDestroyFramebuffer(device, texture.geometryFramebuffer, null);
+            vkDestroyFramebuffer(device, texture.geometryLoadFramebuffer, null);
             vkDestroyImageView(device, texture.imageView, null);
             vkDestroyImage(device, texture.image, null);
             vkFreeMemory(device, texture.imageMemory, null);
@@ -272,9 +367,23 @@ public final class VulkanRenderer implements PicaRenderer {
             vkDestroyBuffer(device, texture.stagingBuffer, null);
             vkFreeMemory(device, texture.stagingMemory, null);
         }
-        vkDestroyPipeline(device, geometryPipeline, null);
+        for (long pipeline : tevPipelines.values()) {
+            vkDestroyPipeline(device, pipeline, null);
+        }
+        tevPipelines.clear();
+        for (GuestTexture texture : textureUnits) {
+            if (texture != null) {
+                destroyGuestTexture(texture);
+            }
+        }
+        destroyGuestTexture(whiteTexture);
+        for (long pool : geometryDescriptorPools) {
+            vkDestroyDescriptorPool(device, pool, null);
+        }
+        vkDestroyDescriptorSetLayout(device, geometryDescriptorSetLayout, null);
         vkDestroyPipelineLayout(device, geometryPipelineLayout, null);
         vkDestroyRenderPass(device, geometryRenderPass, null);
+        vkDestroyRenderPass(device, geometryLoadRenderPass, null);
         vkDestroySampler(device, sampler, null);
         destroySwapchainAndDependents();
         for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
@@ -579,18 +688,20 @@ public final class VulkanRenderer implements PicaRenderer {
     /// *Render pass* dedicado à geometria: mesmo formato de {@link ScreenTexture#image}
     /// (`VK_FORMAT_R8G8B8A8_UNORM`), mas layout final `SHADER_READ_ONLY_OPTIMAL` (a imagem volta
     /// a ser lida pelo pipeline de apresentação da G4 logo em seguida, mesma textura).
-    /// `LOAD_OP_CLEAR`: nesta PR geometria e *blit* de CPU não coexistem no mesmo quadro (sem
-    /// consumidor real que precise dos dois juntos ainda).
-    private long createGeometryRenderPass() {
+    /// São DOIS: um com `LOAD_OP_CLEAR`, usado pela primeira chamada de desenho do quadro (limpa
+    /// com a cor do `GX_MemoryFill` do app), e um com `LOAD_OP_LOAD`, usado pelas seguintes, que
+    /// têm que se acumular por cima em vez de apagar o que já foi desenhado (RFC-N3DSEMU G5/PR4 —
+    /// um quadro real emite várias chamadas de desenho).
+    private long createGeometryRenderPass(boolean clear) {
         try (MemoryStack stack = stackPush()) {
             VkAttachmentDescription.Buffer attachment = VkAttachmentDescription.calloc(1, stack)
                     .format(VK_FORMAT_R8G8B8A8_UNORM)
                     .samples(VK_SAMPLE_COUNT_1_BIT)
-                    .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
+                    .loadOp(clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE)
                     .stencilLoadOp(VK_ATTACHMENT_LOAD_OP_DONT_CARE)
                     .stencilStoreOp(VK_ATTACHMENT_STORE_OP_DONT_CARE)
-                    .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                    .initialLayout(clear ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     .finalLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
             VkAttachmentReference.Buffer colorRef = VkAttachmentReference.calloc(1, stack)
@@ -625,18 +736,56 @@ public final class VulkanRenderer implements PicaRenderer {
     private long createGeometryPipelineLayout() {
         try (MemoryStack stack = stackPush()) {
             VkPipelineLayoutCreateInfo createInfo = VkPipelineLayoutCreateInfo.calloc(stack)
-                    .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+                    .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
+                    .pSetLayouts(stack.longs(geometryDescriptorSetLayout));
             LongBuffer pLayout = stack.mallocLong(1);
             check(vkCreatePipelineLayout(device, createInfo, null, pLayout), "vkCreatePipelineLayout (geometria)");
             return pLayout.get(0);
         }
     }
 
-    private long createGeometryFramebuffer(ScreenTexture texture) {
+    /// Um *binding* de amostrador por unidade de textura declarada pelo GLSL gerado.
+    private long createGeometryDescriptorSetLayout() {
+        try (MemoryStack stack = stackPush()) {
+            VkDescriptorSetLayoutBinding.Buffer bindings =
+                    VkDescriptorSetLayoutBinding.calloc(TEXTURE_BINDING_COUNT, stack);
+            for (int unit = 0; unit < TEXTURE_BINDING_COUNT; unit++) {
+                bindings.get(unit)
+                        .binding(unit)
+                        .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                        .descriptorCount(1)
+                        .stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
+            }
+            VkDescriptorSetLayoutCreateInfo createInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO)
+                    .pBindings(bindings);
+            LongBuffer pLayout = stack.mallocLong(1);
+            check(vkCreateDescriptorSetLayout(device, createInfo, null, pLayout),
+                    "vkCreateDescriptorSetLayout (geometria)");
+            return pLayout.get(0);
+        }
+    }
+
+    private long createGeometryDescriptorPool() {
+        try (MemoryStack stack = stackPush()) {
+            VkDescriptorPoolSize.Buffer size = VkDescriptorPoolSize.calloc(1, stack)
+                    .type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(MAX_DRAW_CALLS_PER_FRAME * TEXTURE_BINDING_COUNT);
+            VkDescriptorPoolCreateInfo createInfo = VkDescriptorPoolCreateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
+                    .pPoolSizes(size)
+                    .maxSets(MAX_DRAW_CALLS_PER_FRAME);
+            LongBuffer pPool = stack.mallocLong(1);
+            check(vkCreateDescriptorPool(device, createInfo, null, pPool), "vkCreateDescriptorPool (geometria)");
+            return pPool.get(0);
+        }
+    }
+
+    private long createGeometryFramebuffer(ScreenTexture texture, long renderPass) {
         try (MemoryStack stack = stackPush()) {
             VkFramebufferCreateInfo framebufferInfo = VkFramebufferCreateInfo.calloc(stack)
                     .sType(VK10.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
-                    .renderPass(geometryRenderPass)
+                    .renderPass(renderPass)
                     .pAttachments(stack.longs(texture.imageView))
                     .width(texture.width)
                     .height(texture.height)
@@ -651,10 +800,18 @@ public final class VulkanRenderer implements PicaRenderer {
     /// `vec4` cor — sem textura/TEV (PR3). *Viewport*/*scissor* **dinâmicos** (`vkCmdSetViewport`/
     /// `vkCmdSetScissor`): TOP e BOTTOM têm dimensões de textura diferentes, um pipeline serve as
     /// duas.
-    private long createGeometryPipeline() {
+    /// Pipeline (e *fragment shader*) para uma configuração TEV, criado sob demanda e **cacheado
+    /// pela configuração inteira** — RFC/task G5: recompilar o mesmo shader a cada quadro é o erro
+    /// clássico aqui. `TevConfig` é um record de `List`s justamente para poder ser chave de mapa.
+    private long geometryPipelineFor(TevConfig tevConfig) {
+        return tevPipelines.computeIfAbsent(tevConfig, this::createGeometryPipeline);
+    }
+
+    private long createGeometryPipeline(TevConfig tevConfig) {
         try (MemoryStack stack = stackPush()) {
-            long vertModule = createShaderModule("shaders/triangle.vert", Shaderc.shaderc_glsl_vertex_shader, stack);
-            long fragModule = createShaderModule("shaders/triangle.frag", Shaderc.shaderc_glsl_fragment_shader, stack);
+            long vertModule = createShaderModule("shaders/geometry.vert", Shaderc.shaderc_glsl_vertex_shader, stack);
+            long fragModule = compileShaderModule(TevGlslGenerator.generate(tevConfig),
+                    Shaderc.shaderc_glsl_fragment_shader, "tev.frag", stack);
             try {
                 VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
                 stages.get(0)
@@ -672,9 +829,12 @@ public final class VulkanRenderer implements PicaRenderer {
                         .binding(0)
                         .stride(GEOMETRY_VERTEX_STRIDE_BYTES)
                         .inputRate(VK_VERTEX_INPUT_RATE_VERTEX);
-                VkVertexInputAttributeDescription.Buffer attributes = VkVertexInputAttributeDescription.calloc(2, stack);
+                VkVertexInputAttributeDescription.Buffer attributes = VkVertexInputAttributeDescription.calloc(5, stack);
                 attributes.get(0).binding(0).location(0).format(VK_FORMAT_R32G32_SFLOAT).offset(0);
-                attributes.get(1).binding(0).location(1).format(VK_FORMAT_R32G32B32A32_SFLOAT).offset(8);
+                attributes.get(1).binding(0).location(1).format(VK_FORMAT_R32G32B32A32_SFLOAT).offset(2 * Float.BYTES);
+                attributes.get(2).binding(0).location(2).format(VK_FORMAT_R32G32_SFLOAT).offset(6 * Float.BYTES);
+                attributes.get(3).binding(0).location(3).format(VK_FORMAT_R32G32_SFLOAT).offset(8 * Float.BYTES);
+                attributes.get(4).binding(0).location(4).format(VK_FORMAT_R32G32_SFLOAT).offset(10 * Float.BYTES);
                 VkPipelineVertexInputStateCreateInfo vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack)
                         .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO)
                         .pVertexBindingDescriptions(binding)
@@ -738,58 +898,174 @@ public final class VulkanRenderer implements PicaRenderer {
         }
     }
 
+    /// Desenha, tela por tela, todas as chamadas acumuladas: cada uma com o pipeline da SUA
+    /// configuração TEV e as texturas que estavam ligadas quando ela foi emitida. Só a primeira
+    /// chamada de cada tela limpa o *color buffer* (com a cor do `GX_MemoryFill` do app); as
+    /// seguintes se acumulam por cima, como no hardware.
     private void drawPendingTriangles(VkCommandBuffer commandBuffer, MemoryStack stack) {
-        for (Map.Entry<Screen, List<ShadedVertex>> entry : screenGeometry.entrySet()) {
-            ScreenTexture texture = textures.get(entry.getKey());
-            List<ShadedVertex> vertices = entry.getValue();
-            if (vertices.isEmpty()) {
-                continue;
+        uploadPendingTextures(commandBuffer, stack);
+        for (Map.Entry<Screen, List<DrawCall>> entry : screenGeometry.entrySet()) {
+            ScreenTexture screenTexture = textures.get(entry.getKey());
+            boolean first = true;
+            for (DrawCall call : entry.getValue()) {
+                if (call.vertices().isEmpty()) {
+                    continue;
+                }
+                drawOne(commandBuffer, screenTexture, entry.getKey(), call, first, stack);
+                first = false;
+                screenTexture.everUploaded = true;
             }
-
-            long[] vertexBufferAndMemory = uploadGeometryVertexBuffer(vertices, stack);
-            long vertexBuffer = vertexBufferAndMemory[0];
-            long vertexBufferMemory = vertexBufferAndMemory[1];
-
-            float[] clear = clearColors.getOrDefault(entry.getKey(), OPAQUE_BLACK);
-            VkClearValue.Buffer clearValues = VkClearValue.calloc(1, stack);
-            clearValues.get(0).color()
-                    .float32(0, clear[0]).float32(1, clear[1]).float32(2, clear[2]).float32(3, clear[3]);
-            VkRenderPassBeginInfo renderPassInfo = VkRenderPassBeginInfo.calloc(stack)
-                    .sType(VK10.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
-                    .renderPass(geometryRenderPass)
-                    .framebuffer(texture.geometryFramebuffer)
-                    .pClearValues(clearValues);
-            renderPassInfo.renderArea().offset().set(0, 0);
-            renderPassInfo.renderArea().extent().set(texture.width, texture.height);
-
-            vkCmdBeginRenderPass(commandBuffer, renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, geometryPipeline);
-
-            VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
-                    .x(0).y(0).width(texture.width).height(texture.height).minDepth(0f).maxDepth(1f);
-            vkCmdSetViewport(commandBuffer, 0, viewport);
-            VkRect2D.Buffer scissor = VkRect2D.calloc(1, stack);
-            scissor.get(0).offset().set(0, 0);
-            scissor.get(0).extent().set(texture.width, texture.height);
-            vkCmdSetScissor(commandBuffer, 0, scissor);
-
-            vkCmdBindVertexBuffers(commandBuffer, 0, stack.longs(vertexBuffer), stack.longs(0));
-            vkCmdDraw(commandBuffer, vertices.size(), 1, 0, 0);
-            vkCmdEndRenderPass(commandBuffer);
-
-            // Buffer host-visible descartável por desenho (RFC/task G5, "Não inclui": "sem
-            // otimização de desempenho — correção primeiro"); liberado só depois que a fila
-            // terminar de usá-lo, senão o driver pode ler memória já desalocada.
-            frameCleanup[currentFrame].add(() -> {
-                vkDestroyBuffer(device, vertexBuffer, null);
-                vkFreeMemory(device, vertexBufferMemory, null);
-            });
-            texture.everUploaded = true;
         }
         // A geometria NÃO é descartada depois de desenhada: ela é o conteúdo persistente da tela
         // (o `color buffer` da PICA200 real também sobrevive até o próximo `MemoryFill`/desenho).
         // Descartá-la fazia o triângulo aparecer só no quadro em que a lista de comandos chegava e
         // sumir nos seguintes — o "flash" observado na validação da G5.
+    }
+
+    private void drawOne(VkCommandBuffer commandBuffer, ScreenTexture screenTexture, Screen screen, DrawCall call,
+                          boolean clearFirst, MemoryStack stack) {
+        long[] vertexBufferAndMemory = uploadGeometryVertexBuffer(call.vertices(), stack);
+        long vertexBuffer = vertexBufferAndMemory[0];
+        long vertexBufferMemory = vertexBufferAndMemory[1];
+
+        float[] clear = clearColors.getOrDefault(screen, OPAQUE_BLACK);
+        VkClearValue.Buffer clearValues = VkClearValue.calloc(1, stack);
+        clearValues.get(0).color()
+                .float32(0, clear[0]).float32(1, clear[1]).float32(2, clear[2]).float32(3, clear[3]);
+        VkRenderPassBeginInfo renderPassInfo = VkRenderPassBeginInfo.calloc(stack)
+                .sType(VK10.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
+                .renderPass(clearFirst ? geometryRenderPass : geometryLoadRenderPass)
+                .framebuffer(clearFirst ? screenTexture.geometryFramebuffer : screenTexture.geometryLoadFramebuffer)
+                .pClearValues(clearValues);
+        renderPassInfo.renderArea().offset().set(0, 0);
+        renderPassInfo.renderArea().extent().set(screenTexture.width, screenTexture.height);
+
+        vkCmdBeginRenderPass(commandBuffer, renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, geometryPipelineFor(call.tevConfig()));
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, geometryPipelineLayout, 0,
+                stack.longs(allocateTextureDescriptorSet(call.textures(), stack)), null);
+
+        VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
+                .x(0).y(0).width(screenTexture.width).height(screenTexture.height).minDepth(0f).maxDepth(1f);
+        vkCmdSetViewport(commandBuffer, 0, viewport);
+        VkRect2D.Buffer scissor = VkRect2D.calloc(1, stack);
+        scissor.get(0).offset().set(0, 0);
+        scissor.get(0).extent().set(screenTexture.width, screenTexture.height);
+        vkCmdSetScissor(commandBuffer, 0, scissor);
+
+        vkCmdBindVertexBuffers(commandBuffer, 0, stack.longs(vertexBuffer), stack.longs(0));
+        vkCmdDraw(commandBuffer, call.vertices().size(), 1, 0, 0);
+        vkCmdEndRenderPass(commandBuffer);
+
+        // Buffer host-visible descartável por desenho (RFC/task G5, "Não inclui": "sem
+        // otimização de desempenho — correção primeiro"); liberado só depois que a fila
+        // terminar de usá-lo, senão o driver pode ler memória já desalocada.
+        frameCleanup[currentFrame].add(() -> {
+            vkDestroyBuffer(device, vertexBuffer, null);
+            vkFreeMemory(device, vertexBufferMemory, null);
+        });
+    }
+
+    /// Aloca um descritor com as 4 unidades desta chamada; as desligadas recebem a textura branca
+    /// (nunca um descritor não escrito — mesma classe de bug da G4.2).
+    private long allocateTextureDescriptorSet(GuestTexture[] units, MemoryStack stack) {
+        VkDescriptorSetAllocateInfo allocInfo = VkDescriptorSetAllocateInfo.calloc(stack)
+                .sType(VK10.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO)
+                .descriptorPool(geometryDescriptorPools[currentFrame])
+                .pSetLayouts(stack.longs(geometryDescriptorSetLayout));
+        LongBuffer pSet = stack.mallocLong(1);
+        check(vkAllocateDescriptorSets(device, allocInfo, pSet), "vkAllocateDescriptorSets (geometria)");
+        long descriptorSet = pSet.get(0);
+
+        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(TEXTURE_BINDING_COUNT, stack);
+        for (int unit = 0; unit < TEXTURE_BINDING_COUNT; unit++) {
+            GuestTexture bound = units[unit] != null && units[unit].everUploaded ? units[unit] : whiteTexture;
+            VkDescriptorImageInfo.Buffer imageInfo = VkDescriptorImageInfo.calloc(1, stack)
+                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    .imageView(bound.imageView)
+                    .sampler(sampler);
+            writes.get(unit)
+                    .sType(VK10.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
+                    .dstSet(descriptorSet)
+                    .dstBinding(unit)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1)
+                    .pImageInfo(imageInfo);
+        }
+        vkUpdateDescriptorSets(device, writes, null);
+        return descriptorSet;
+    }
+
+    // ── texturas do guest residentes na GPU do hospedeiro ───────────────────────────────────
+
+    private GuestTexture createGuestTexture(int width, int height) {
+        GuestTexture texture = new GuestTexture();
+        texture.width = width;
+        texture.height = height;
+        long[] imageAndMemory = createImage(width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        texture.image = imageAndMemory[0];
+        texture.imageMemory = imageAndMemory[1];
+        texture.imageView = createImageView(texture.image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+        return texture;
+    }
+
+    private void destroyGuestTexture(GuestTexture texture) {
+        vkDestroyImageView(device, texture.imageView, null);
+        vkDestroyImage(device, texture.image, null);
+        vkFreeMemory(device, texture.imageMemory, null);
+    }
+
+    /// Textura 1×1 branca opaca, ligada nas unidades desligadas: `texture(...)` devolve
+    /// `vec4(1.0)`, elemento neutro de `Modulate` — a operação TEV mais comum.
+    private GuestTexture createWhiteTexture() {
+        GuestTexture texture = createGuestTexture(1, 1);
+        texture.pendingRgba8 = new byte[]{-1, -1, -1, -1};
+        return texture;
+    }
+
+    private void uploadPendingTextures(VkCommandBuffer commandBuffer, MemoryStack stack) {
+        uploadGuestTextureIfPending(commandBuffer, whiteTexture, stack);
+        for (GuestTexture texture : textureUnits) {
+            if (texture != null) {
+                uploadGuestTextureIfPending(commandBuffer, texture, stack);
+            }
+        }
+    }
+
+    private void uploadGuestTextureIfPending(VkCommandBuffer commandBuffer, GuestTexture texture, MemoryStack stack) {
+        if (texture.pendingRgba8 == null) {
+            return;
+        }
+        byte[] pixels = texture.pendingRgba8;
+        texture.pendingRgba8 = null;
+
+        long[] stagingBufferAndMemory = createBuffer(pixels.length, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        long stagingBuffer = stagingBufferAndMemory[0];
+        long stagingMemory = stagingBufferAndMemory[1];
+        PointerBuffer pData = stack.mallocPointer(1);
+        check(vkMapMemory(device, stagingMemory, 0, pixels.length, 0, pData), "vkMapMemory (textura)");
+        pData.getByteBuffer(0, pixels.length).put(pixels);
+        vkUnmapMemory(device, stagingMemory);
+
+        int oldLayout = texture.everUploaded ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        transitionImageLayout(commandBuffer, texture.image, oldLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, stack);
+        VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
+                .bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+        region.imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+        region.imageOffset().set(0, 0, 0);
+        region.imageExtent().set(texture.width, texture.height, 1);
+        vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, texture.image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+        transitionImageLayout(commandBuffer, texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, stack);
+        texture.everUploaded = true;
+
+        frameCleanup[currentFrame].add(() -> {
+            vkDestroyBuffer(device, stagingBuffer, null);
+            vkFreeMemory(device, stagingMemory, null);
+        });
     }
 
     private long[] uploadGeometryVertexBuffer(List<ShadedVertex> vertices, MemoryStack stack) {
@@ -801,7 +1077,10 @@ public final class VulkanRenderer implements PicaRenderer {
         ByteBuffer mapped = pData.getByteBuffer(0, (int) sizeBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
         for (ShadedVertex v : vertices) {
             mapped.putFloat(v.ndcX()).putFloat(v.ndcY())
-                    .putFloat(v.r()).putFloat(v.g()).putFloat(v.b()).putFloat(v.a());
+                    .putFloat(v.r()).putFloat(v.g()).putFloat(v.b()).putFloat(v.a())
+                    .putFloat(v.u0()).putFloat(v.v0())
+                    .putFloat(v.u1()).putFloat(v.v1())
+                    .putFloat(v.u2()).putFloat(v.v2());
         }
         vkUnmapMemory(device, bufferAndMemory[1]);
         return bufferAndMemory;
@@ -1017,7 +1296,13 @@ public final class VulkanRenderer implements PicaRenderer {
     }
 
     private long createShaderModule(String classpathResource, int shaderKind, MemoryStack stack) {
-        String source = readResourceAsString(classpathResource);
+        return compileShaderModule(readResourceAsString(classpathResource), shaderKind, classpathResource, stack);
+    }
+
+    /// Compila GLSL vindo de qualquer lugar — de um recurso do jar ou GERADO em tempo de execução
+    /// a partir da configuração TEV (RFC-N3DSEMU G5/PR4).
+    private long compileShaderModule(String source, int shaderKind, String name, MemoryStack stack) {
+        String classpathResource = name;
         long compiler = Shaderc.shaderc_compiler_initialize();
         if (compiler == MemoryUtil.NULL) {
             throw new VulkanUnavailableException("shaderc_compiler_initialize falhou");
@@ -1070,7 +1355,8 @@ public final class VulkanRenderer implements PicaRenderer {
             texture.image = imageAndMemory[0];
             texture.imageMemory = imageAndMemory[1];
             texture.imageView = createImageView(texture.image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
-            texture.geometryFramebuffer = createGeometryFramebuffer(texture);
+            texture.geometryFramebuffer = createGeometryFramebuffer(texture, geometryRenderPass);
+            texture.geometryLoadFramebuffer = createGeometryFramebuffer(texture, geometryLoadRenderPass);
 
             long sizeBytes = (long) texture.width * texture.height * 4;
             long[] bufferAndMemory = createBuffer(sizeBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -1242,6 +1528,11 @@ public final class VulkanRenderer implements PicaRenderer {
         try (MemoryStack stack = stackPush()) {
             vkWaitForFences(device, inFlightFences[currentFrame], true, Long.MAX_VALUE);
             runAndClear(frameCleanup[currentFrame]);
+            // A cerca acima garante que a GPU terminou o quadro anterior DESTE slot, então os
+            // descritores de geometria que ele alocou podem ser reciclados de uma vez (é por isso
+            // que há um pool por slot, e não um só compartilhado).
+            check(vkResetDescriptorPool(device, geometryDescriptorPools[currentFrame], 0),
+                    "vkResetDescriptorPool (geometria)");
 
             IntBuffer pImageIndex = stack.mallocInt(1);
             int acquireResult = vkAcquireNextImageKHR(device, swapchain, Long.MAX_VALUE,

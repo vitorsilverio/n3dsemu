@@ -18,6 +18,15 @@ public interface PicaRenderer {
     /// nenhum estágio.
     void drawTriangles(Screen screen, java.util.List<ShadedVertex> vertices);
 
+    /// Configuração dos 6 estágios TEV + teste de alpha em vigor para os próximos
+    /// {@link #drawTriangles} (RFC-N3DSEMU G5/PR4). É ela que determina o *fragment shader*: o
+    /// renderer gera o GLSL com `TevGlslGenerator`, compila e **cacheia por configuração**.
+    void setTevConfig(dev.vitorsilverio.n3dsemu.gpu.tev.TevConfig config);
+
+    /// Textura ligada à unidade `unit` (`0`-`2`), ou `null` se a unidade está desligada
+    /// (RFC-N3DSEMU G5/PR4). Já vem desembaralhada em `RGBA8` linear.
+    void setTexture(int unit, PicaTexture texture);
+
     /// Cor com que o *color buffer* daquela tela foi limpo pelo app (`GX_MemoryFill`, disparado
     /// por `C3D_RenderTargetClear`) — é o FUNDO sobre o qual {@link #drawTriangles} desenha.
     /// Componentes normalizados em `[0,1]`.

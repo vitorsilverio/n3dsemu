@@ -11,6 +11,8 @@ import dev.vitorsilverio.n3dsemu.gpu.RegisterWriteListener;
 import dev.vitorsilverio.n3dsemu.gpu.PicaRenderer;
 import dev.vitorsilverio.n3dsemu.gpu.PixelFormat;
 import dev.vitorsilverio.n3dsemu.gpu.Screen;
+import dev.vitorsilverio.n3dsemu.gpu.TextureUnits;
+import dev.vitorsilverio.n3dsemu.gpu.tev.TevConfig;
 import dev.vitorsilverio.n3dsemu.gpu.VertexPipeline;
 import dev.vitorsilverio.n3dsemu.gpu.shader.ShaderUpload;
 import dev.vitorsilverio.n3dsemu.kernel.EventObject;
@@ -25,7 +27,9 @@ import dev.vitorsilverio.n3dsemu.ipc.IpcResponse;
 import dev.vitorsilverio.n3dsemu.memory.MemoryMap;
 
 import java.io.PrintStream;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -179,6 +183,10 @@ public final class GspGpuService extends AbstractService {
     /// há para onde desenhar).
     private final PicaRenderer renderer;
 
+    /// Endereço do *color buffer* → tela para onde ele é transferido, aprendido dos
+    /// `GX_DisplayTransfer` (ver {@link #rememberColorBufferScreen}).
+    private final Map<Integer, Screen> colorBufferScreen = new HashMap<>();
+
     private EventObject interruptEvent;
     private long commandListsTriggered;
     private Runnable vBlankListener;
@@ -268,7 +276,8 @@ public final class GspGpuService extends AbstractService {
         Object resolvedBlock = handles.resolve(gspSharedMemoryHandle).orElse(null);
         if (resolvedBlock instanceof MemoryBlockObject block && block.hostMapped()) {
             List<Integer> events = GxCommandQueue.processPending(
-                    memory, block.address() + GX_COMMAND_QUEUE_OFFSET, this::handleCommandListWords);
+                    memory, block.address() + GX_COMMAND_QUEUE_OFFSET, this::handleCommandListWords,
+                    this::rememberColorBufferScreen);
             for (int event : events) {
                 pushInterrupt(block.address(), event);
             }
@@ -281,8 +290,8 @@ public final class GspGpuService extends AbstractService {
 
     /// Aplica uma lista de comandos PICA200 crua nos registradores/no upload de shader e, se um
     /// `DrawArrays`/`DrawElements` de verdade foi disparado por ela, desenha no {@link #renderer}
-    /// (RFC-N3DSEMU G5/PR3). **Simplificação documentada**: sempre {@link Screen#TOP} — a única
-    /// tela composta por este HLE (RFC D6, mesma simplificação já usada em toda a G3/G4/G5). Se
+    /// (RFC-N3DSEMU G5/PR3). A tela de destino vem de {@link #currentScreen()} (PR4 — antes era
+    /// sempre {@link Screen#TOP}, fixo). Se
     /// múltiplos disparos acontecem dentro da MESMA lista, todos leem o estado FINAL dos
     /// registradores (não um estado por disparo) — suficiente para `simple_tri`, que desenha uma
     /// vez por lista.
@@ -293,20 +302,52 @@ public final class GspGpuService extends AbstractService {
         if (renderer == null || !shaderUpload.hasProgram()) {
             return;
         }
+        Screen screen = currentScreen();
         if (gpuRegisters.drawArraysTriggerCount() > arraysBefore
                 || gpuRegisters.drawElementsTriggerCount() > elementsBefore) {
-            renderer.setClearColor(Screen.TOP, readColorBufferClearColor());
+            renderer.setClearColor(screen, readColorBufferClearColor());
+            renderer.setTevConfig(TevConfig.decode(gpuRegisters));
+            for (int unit = 0; unit < TextureUnits.UNIT_COUNT; unit++) {
+                renderer.setTexture(unit, TextureUnits.read(gpuRegisters, memory, unit));
+            }
         }
         if (gpuRegisters.drawArraysTriggerCount() > arraysBefore) {
             VertexPipeline.drawArrays(shaderUpload.toShaderBinary(), shaderUpload.toExecutable(), gpuRegisters,
                     memory, shaderUpload.floatConstants(), shaderUpload.intConstants(), shaderUpload.boolConstants(),
-                    shaderUpload.attributeToInputRegister(), fixedAttributes, Screen.TOP, renderer);
+                    shaderUpload.attributeToInputRegister(), fixedAttributes, screen, renderer);
         }
         if (gpuRegisters.drawElementsTriggerCount() > elementsBefore) {
             VertexPipeline.drawElements(shaderUpload.toShaderBinary(), shaderUpload.toExecutable(), gpuRegisters,
                     memory, shaderUpload.floatConstants(), shaderUpload.intConstants(), shaderUpload.boolConstants(),
-                    shaderUpload.attributeToInputRegister(), fixedAttributes, Screen.TOP, renderer);
+                    shaderUpload.attributeToInputRegister(), fixedAttributes, screen, renderer);
         }
+    }
+
+    /// Aprende a que TELA um *color buffer* pertence, observando o `GX_DisplayTransfer` que o
+    /// leva até o framebuffer (RFC-N3DSEMU G5/PR4). Os registradores internos da PICA200 só
+    /// guardam endereços — "tela de cima"/"tela de baixo" é informação que só existe neste
+    /// comando, comparando o DESTINO com o framebuffer ativo de cada tela.
+    ///
+    /// **Consequência de ordem**: o transfer de um quadro acontece DEPOIS do desenho daquele
+    /// quadro, então o primeiro desenho de um app cai no default ({@link Screen#TOP}) e só a
+    /// partir do segundo quadro a tela é a de verdade. Para um app de tela única — a esmagadora
+    /// maioria, incl. `simple_tri` — o default já é o certo desde o primeiro quadro.
+    private void rememberColorBufferScreen(int sourceAddress, int destinationAddress) {
+        for (Screen screen : Screen.values()) {
+            FrameBufferState.Buffer buffer = frameBufferState.active(screen);
+            if (buffer != null && buffer.address() == destinationAddress) {
+                colorBufferScreen.put(sourceAddress, screen);
+                return;
+            }
+        }
+    }
+
+    /// Tela de destino do *color buffer* corrente — {@link Screen#TOP} enquanto nenhum
+    /// `DisplayTransfer` tiver revelado outra coisa (ver {@link #rememberColorBufferScreen}).
+    private Screen currentScreen() {
+        int colorBuffer = ColorBufferFormat.locationFromRegister(
+                gpuRegisters.read(ColorBufferFormat.REGISTER_LOCATION));
+        return colorBufferScreen.getOrDefault(colorBuffer, Screen.TOP);
     }
 
     /// Cor de fundo do quadro: o `GX_MemoryFill` disparado por `C3D_RenderTargetClear` já pintou

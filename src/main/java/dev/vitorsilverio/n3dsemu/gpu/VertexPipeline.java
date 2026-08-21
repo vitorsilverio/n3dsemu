@@ -56,8 +56,7 @@ public final class VertexPipeline {
                               AddressSpace memory, float[][] floatConstants, int[][] intConstants,
                               boolean[] boolConstants, int[] attributeToInputRegister, FixedAttributes fixedAttributes,
                               List<Integer> vertexIndices, Screen screen, PicaRenderer renderer) {
-        ShaderBinary.OutputRegister position = findOutput(executable, ShaderBinary.OutputRegister.SEMANTIC_POSITION);
-        ShaderBinary.OutputRegister color = findOutput(executable, ShaderBinary.OutputRegister.SEMANTIC_COLOR);
+        OutputMap outputMap = OutputMap.decode(loader.registers());
 
         List<ShadedVertex> shaded = new ArrayList<>(vertexIndices.size());
         for (int vertexIndex : vertexIndices) {
@@ -76,24 +75,48 @@ public final class VertexPipeline {
 
             float[][] output = VertexShaderInterpreter.run(shader, executable.mainOffset(), input, floatConstants,
                     intConstants, boolConstants);
-            shaded.add(toShadedVertex(output[position.registerId()], output[color.registerId()]));
+            shaded.add(toShadedVertex(outputMap, executable, output));
         }
         renderer.drawTriangles(screen, shaded);
     }
 
-    private static ShaderBinary.OutputRegister findOutput(ShaderBinary.Executable executable, int semantic) {
+    /// Distribui a saída crua do shader por semântica (RFC-N3DSEMU G5/PR4) e monta o vértice
+    /// final. Se a lista de comandos ainda não programou o `SH_OUTMAP` (banco de registradores
+    /// zerado — o caso dos testes unitários que montam o estado à mão), cai na convenção do
+    /// `picasso`/`citro3d` que a PR3 assumia: `o0`=posição, `o1`=cor, sem textura.
+    private static ShadedVertex toShadedVertex(OutputMap outputMap, ShaderBinary.Executable executable,
+                                                float[][] output) {
+        if (outputMap.isUnprogrammed()) {
+            return fromPicassoConvention(executable, output);
+        }
+        float[] bySemantic = outputMap.gather(output);
+        return project(
+                bySemantic[OutputMap.SEMANTIC_POSITION_X], bySemantic[OutputMap.SEMANTIC_POSITION_X + 1],
+                bySemantic[OutputMap.SEMANTIC_POSITION_X + 3],
+                new float[]{bySemantic[OutputMap.SEMANTIC_COLOR_R], bySemantic[OutputMap.SEMANTIC_COLOR_R + 1],
+                        bySemantic[OutputMap.SEMANTIC_COLOR_R + 2], bySemantic[OutputMap.SEMANTIC_COLOR_R + 3]},
+                new float[]{bySemantic[OutputMap.SEMANTIC_TEXCOORD0_U], bySemantic[OutputMap.SEMANTIC_TEXCOORD0_U + 1],
+                        bySemantic[OutputMap.SEMANTIC_TEXCOORD1_U], bySemantic[OutputMap.SEMANTIC_TEXCOORD1_U + 1],
+                        bySemantic[OutputMap.SEMANTIC_TEXCOORD2_U], bySemantic[OutputMap.SEMANTIC_TEXCOORD2_U + 1]});
+    }
+
+    private static ShadedVertex fromPicassoConvention(ShaderBinary.Executable executable, float[][] output) {
+        float[] clipPosition = output[findOutput(executable, ShaderBinary.OutputRegister.SEMANTIC_POSITION)];
+        float[] color = output[findOutput(executable, ShaderBinary.OutputRegister.SEMANTIC_COLOR)];
+        return project(clipPosition[0], clipPosition[1], clipPosition[3], color, new float[6]);
+    }
+
+    private static int findOutput(ShaderBinary.Executable executable, int semantic) {
         for (ShaderBinary.OutputRegister output : executable.outputRegisters()) {
             if (output.semanticType() == semantic) {
-                return output;
+                return output.registerId();
             }
         }
         throw new IllegalArgumentException("shader não declara nenhuma saída de semântica " + semantic);
     }
 
-    private static ShadedVertex toShadedVertex(float[] clipPosition, float[] color) {
-        float w = clipPosition[3];
-        float ndcX = clipPosition[0] / w;
-        float ndcY = clipPosition[1] / w;
-        return new ShadedVertex(ndcX, ndcY, color[0], color[1], color[2], color[3]);
+    private static ShadedVertex project(float clipX, float clipY, float clipW, float[] color, float[] texCoords) {
+        return new ShadedVertex(clipX / clipW, clipY / clipW, color[0], color[1], color[2], color[3],
+                texCoords[0], texCoords[1], texCoords[2], texCoords[3], texCoords[4], texCoords[5]);
     }
 }

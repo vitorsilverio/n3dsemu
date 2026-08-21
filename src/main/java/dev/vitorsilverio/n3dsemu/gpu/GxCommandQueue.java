@@ -51,6 +51,11 @@ public final class GxCommandQueue {
     private static final int MEMORY_FILL_BUFFER0_START = 0x4;
     private static final int MEMORY_FILL_BUFFER1_START = 0x10;
     private static final int MEMORY_FILL_CONTROLS = 0x1C;
+    // `GX_DisplayTransfer(inadr, indim, outadr, outdim, flags)` — atenção: no `gxCmdEntry_s` real
+    // (`gx.c`) os dois ENDEREÇOS vêm juntos (args 1 e 2) e só depois as dimensões, ordem diferente
+    // da assinatura da função C.
+    private static final int DISPLAY_TRANSFER_SOURCE = 0x4;
+    private static final int DISPLAY_TRANSFER_DESTINATION = 0x8;
     private static final int MEMORY_FILL_VALUE_OFFSET = 0x4;
     private static final int MEMORY_FILL_END_OFFSET = 0x8;
     private static final int MEMORY_FILL_CONTROL1_SHIFT = 16;
@@ -87,6 +92,14 @@ public final class GxCommandQueue {
         void onCommandList(int[] words);
     }
 
+    /// Recebe um `GX_DisplayTransfer` (`GPU: color buffer → framebuffer da tela`): é a única
+    /// informação que diz A QUE TELA um *color buffer* pertence — os registradores internos da
+    /// PICA200 só guardam endereços, nunca "tela de cima"/"tela de baixo" (RFC-N3DSEMU G5/PR4).
+    @FunctionalInterface
+    public interface DisplayTransferSink {
+        void onDisplayTransfer(int sourceAddress, int destinationAddress);
+    }
+
     private GxCommandQueue() {
     }
 
@@ -106,13 +119,20 @@ public final class GxCommandQueue {
     /// isso, `gxCmdQueueWait`/`gspWaitForEvent` do guest trava para sempre (mesma classe de bug já
     /// documentada para VBlank/`RegisterInterruptRelayQueue`, ver Javadoc de `GspGpuService`).
     public static List<Integer> processPending(AddressSpace memory, int queueBase, CommandListSink sink) {
+        return processPending(memory, queueBase, sink, (source, destination) -> { });
+    }
+
+    /// Como a sobrecarga acima, mas também informa cada `DisplayTransfer` processado (RFC-N3DSEMU
+    /// G5/PR4) — ver {@link DisplayTransferSink}.
+    public static List<Integer> processPending(AddressSpace memory, int queueBase, CommandListSink sink,
+                                                DisplayTransferSink displayTransferSink) {
         List<Integer> events = new ArrayList<>();
         int commandIndex = memory.read8(queueBase + OFFSET_COMMAND_INDEX) & U8_MASK;
         int pending = memory.read8(queueBase + OFFSET_TOTAL_COMMANDS) & U8_MASK;
         for (int processed = 0; processed < pending; processed++) {
             int entryBase = queueBase + OFFSET_ENTRIES + (commandIndex % MAX_ENTRIES) * ENTRY_SIZE_BYTES;
             int type = memory.read8(entryBase + ENTRY_OFFSET_TYPE) & U8_MASK;
-            processEntry(memory, entryBase, type, sink, events);
+            processEntry(memory, entryBase, type, sink, displayTransferSink, events);
             commandIndex = (commandIndex + 1) % MAX_ENTRIES;
         }
         memory.write8(queueBase + OFFSET_COMMAND_INDEX, commandIndex);
@@ -126,7 +146,7 @@ public final class GxCommandQueue {
     }
 
     private static void processEntry(AddressSpace memory, int entryBase, int type, CommandListSink sink,
-                                      List<Integer> events) {
+                                      DisplayTransferSink displayTransferSink, List<Integer> events) {
         switch (type) {
             case TYPE_PROCESS_COMMAND_LIST -> {
                 int bufferAddress = memory.read32(entryBase + ENTRY_OFFSET_ARG1);
@@ -141,7 +161,12 @@ public final class GxCommandQueue {
                         (controls >>> MEMORY_FILL_CONTROL1_SHIFT) & MEMORY_FILL_CONTROL_MASK);
                 events.add(EVENT_PSC0);
             }
-            case TYPE_DISPLAY_TRANSFER, TYPE_TEXTURE_COPY -> events.add(EVENT_PPF);
+            case TYPE_DISPLAY_TRANSFER -> {
+                displayTransferSink.onDisplayTransfer(memory.read32(entryBase + DISPLAY_TRANSFER_SOURCE),
+                        memory.read32(entryBase + DISPLAY_TRANSFER_DESTINATION));
+                events.add(EVENT_PPF);
+            }
+            case TYPE_TEXTURE_COPY -> events.add(EVENT_PPF);
             case TYPE_REQUEST_DMA -> events.add(EVENT_DMA);
             case TYPE_FLUSH_CACHE_REGIONS -> { } // 3dbrew: não enfileirável/sem evento de conclusão próprio.
             default -> { } // tipo desconhecido: ignora, mesma postura conservadora do resto do HLE.
