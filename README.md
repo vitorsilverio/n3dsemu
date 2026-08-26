@@ -135,6 +135,16 @@ src/main/resources/shaders/  present.vert/present.frag (compilados via lwjgl-sha
 testdata/    corpus .3dsx/.elf compilado do devkitPro (ver testdata/README.md)
 ```
 
+## Como contribuir
+
+Issues e pull requests são bem-vindos — ver [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Autor e contato
+
+Feito por [Vitor Silvério Rodrigues](https://vitorsilverio.dev/) — blog/currículo com mais
+detalhes sobre este e outros projetos. Contato: vitor.silverio.rodrigues@gmail.com ou uma
+[issue](https://github.com/vitorsilverio/n3dsemu/issues) neste repositório.
+
 ## Licença
 
 BSD 3-Clause — ver [LICENSE](LICENSE).
