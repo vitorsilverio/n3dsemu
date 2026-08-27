@@ -150,7 +150,7 @@ public final class N3dsMachine {
         serviceRegistry.registerAlias("APT:S", aptService);
         serviceRegistry.registerAlias("APT:A", aptService);
         serviceRegistry.register(hidService);
-        serviceRegistry.register(new FsUserService(diagnosticLog));
+        serviceRegistry.register(new FsUserService(diagnosticLog, handles, serviceRegistry, memory, image.rawFile()));
         serviceRegistry.register(gspGpuService);
         serviceRegistry.register(new CfgUService(diagnosticLog, memory));
         serviceRegistry.register(new PtmUService(diagnosticLog));

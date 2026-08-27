@@ -164,7 +164,7 @@ public final class Loader3dsx {
                 cursor = applyRelocations(segments[segment], segmentFileOffsets[segment], table, file, cursor, count);
             }
         }
-        return new Image3dsx(LOAD_BASE, LOAD_BASE, code, rodata, dataWithBss);
+        return new Image3dsx(LOAD_BASE, LOAD_BASE, code, rodata, dataWithBss, file);
     }
 
     private int applyRelocations(byte[] segment, int segmentFileOffset, int table, byte[] file, int cursor,

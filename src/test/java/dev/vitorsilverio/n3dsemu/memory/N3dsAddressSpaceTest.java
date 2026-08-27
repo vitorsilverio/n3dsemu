@@ -18,7 +18,8 @@ class N3dsAddressSpaceTest {
         byte[] code = {0x11, 0x22, 0x33, 0x44};
         byte[] rodata = {0x55, 0x66, 0x77, (byte) 0x88};
         byte[] dataWithBss = {(byte) 0x99, (byte) 0xAA, 0, 0};
-        return new Image3dsx(MemoryMap.EXECUTABLE_BASE, MemoryMap.EXECUTABLE_BASE, code, rodata, dataWithBss);
+        return new Image3dsx(MemoryMap.EXECUTABLE_BASE, MemoryMap.EXECUTABLE_BASE, code, rodata, dataWithBss,
+                new byte[0]);
     }
 
     /// **G3, achado real (ver Javadoc de {@link Loader3dsx}):** rodata/data NÃO ficam logo

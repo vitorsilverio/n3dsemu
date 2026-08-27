@@ -29,4 +29,11 @@ public final class ServiceRegistry {
     public Optional<Service> resolve(String name) {
         return Optional.ofNullable(services.get(name));
     }
+
+    /// Remove o registro de `name` (RFC-N3DSEMU G6.2 — `FSFILE::Close` desfaz o nome sintético
+    /// criado por `FSUSER::OpenFileDirectly` para a sessão do arquivo; sem isso, cada arquivo
+    /// aberto/fechado durante a vida do processo guest deixaria uma entrada morta neste mapa).
+    public void unregister(String name) {
+        services.remove(Objects.requireNonNull(name, "name"));
+    }
 }
