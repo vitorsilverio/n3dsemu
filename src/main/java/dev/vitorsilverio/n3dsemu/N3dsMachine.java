@@ -28,6 +28,7 @@ import dev.vitorsilverio.n3dsemu.service.CfgUService;
 import dev.vitorsilverio.n3dsemu.service.FsUserService;
 import dev.vitorsilverio.n3dsemu.service.GspGpuService;
 import dev.vitorsilverio.n3dsemu.service.HidService;
+import dev.vitorsilverio.n3dsemu.service.PtmSysmService;
 import dev.vitorsilverio.n3dsemu.service.PtmUService;
 import dev.vitorsilverio.n3dsemu.service.ServiceRegistry;
 import dev.vitorsilverio.n3dsemu.service.SrvService;
@@ -154,6 +155,7 @@ public final class N3dsMachine {
         serviceRegistry.register(gspGpuService);
         serviceRegistry.register(new CfgUService(diagnosticLog, memory));
         serviceRegistry.register(new PtmUService(diagnosticLog));
+        serviceRegistry.register(new PtmSysmService(diagnosticLog));
 
         SvcTable svcTable = new SvcTable(memory, diagnosticLog, traceSvc, handles, memoryManager, scheduler, serviceRegistry);
         ArmCore core = new ArmCore(memory, svcTable.dispatcher(), architecture);
