@@ -11,16 +11,29 @@ package dev.vitorsilverio.n3dsemu.gpu.shader;
 /// bit a bit contra um `.shbin` real compilado pelo `picasso` (`simple_tri`, conferido instrução
 /// a instrução contra o `.v.pica` de origem — ver `ShaderBinaryTest`/`VertexShaderInterpreterTest`).
 ///
-/// **Escopo desta PR (G5/PR2): só os formatos 1/1u** (`ADD`/`DP3`/`DP4`/`DPH`/`MUL`/`SGE`/`SLT`/
+/// **Escopo original (G5/PR2): formatos 1/1u** (`ADD`/`DP3`/`DP4`/`DPH`/`MUL`/`SGE`/`SLT`/
 /// `MAX`/`MIN`/`EX2`/`LG2`/`FLR`/`RCP`/`RSQ`/`MOVA`/`MOV`/`END`/`NOP`) — o suficiente para
-/// `simple_tri` (único consumidor real disponível). **Não implementados** (lançam
-/// `UnsupportedOperationException`): `DST`/`LITP` (formato 1, mas semântica especial), o formato
-/// **1c** (`CMP`), **1i** (`DPHI`/`DSTI`/`SGEI`/`SLTI`), **5/5i** (`MAD`/`MADI`) e todo o controle
-/// de fluxo (`CALL`/`IFU`/`IFC`/`LOOP`/`JMPC`/`JMPU`/`BREAK`/`BREAKC`) — o layout de bits exato
-/// desses formatos não pôde ser cross-validado contra um `.shbin` real nesta sessão (só
-/// transcrição de boa-fé do 3dbrew, com números inconsistentes entre buscas — ver histórico da
-/// task G5 PR2) e nenhum exemplo do marco M5 os usa. Candidatos a uma PR de extensão quando um
-/// consumidor real (ex.: `textured_cube`, que usa laços) aparecer.
+/// `simple_tri` (único consumidor real disponível na época).
+///
+/// **G6.3 acrescentou o formato 1c** (`CMP`, opcodes `0x2E`/`0x2F`) **e os formatos 5/5i**
+/// (`MAD`/`MADI`, opcodes `0x38`-`0x3F`/`0x30`-`0x37`) — layout de bits validado contra o código
+/// fonte real do <a href="https://github.com/neobrain/nihstro">nihstro</a>
+/// (`include/nihstro/shader_bytecode.h`, `union Instruction::Common`/`::mad`), não só o wiki do
+/// 3dbrew (que não documenta offsets de bit) — `curl` direto do arquivo raw do GitHub nesta
+/// sessão, ver task `g6.3-vertex-shader-cmp-mad.md` para o detalhe. Achado real: os opcodes `CMP`/
+/// `MAD`/`MADI` têm bits "ignorados" na identificação (LSB para `CMP`, 3 bits baixos para
+/// `MAD`/`MADI`) que na verdade são dados reais (`cmp.x`/parte do registrador de destino) —
+/// tratado despachando por FAIXA de opcode (`>= 0x38`/`>= 0x30`/`== 0x2E ou 0x2F`) antes do
+/// `switch` do formato 1, e relendo os bits de volta do word bruto dentro de cada handler (nunca
+/// do valor de opcode já decodificado).
+///
+/// **Ainda não implementados** (lançam `UnsupportedOperationException`): `DST`/`LITP` (formato 1,
+/// mas semântica especial), o formato **1i** (`DPHI`/`DSTI`/`SGEI`/`SLTI`) e todo o controle de
+/// fluxo (`CALL`/`IFU`/`IFC`/`LOOP`/`JMPC`/`JMPU`/`BREAK`/`BREAKC`) — `CMP` grava em `cmp.x`/`cmp.y`
+/// (ver {@link Result#conditionCode()}), mas nada ainda LÊ essas condition codes (não há `JMPC`/
+/// `IFC`/`BREAKC`), então o efeito observável de `CMP` hoje é só o valor exposto por
+/// {@link #runDetailed}. Candidatos a uma PR de extensão quando um consumidor real (ex.:
+/// `textured_cube`, que usa laços/condicionais) aparecer.
 public final class VertexShaderInterpreter {
     public static final int NUM_INPUT_REGISTERS = 16;
     public static final int NUM_TEMP_REGISTERS = 16;
@@ -76,7 +89,25 @@ public final class VertexShaderInterpreter {
     /// {@link ShaderBinary.OutputRegister}.
     public static float[][] run(ShaderBinary shader, int mainOffset, float[][] inputRegisters,
                                  float[][] floatConstants, int[][] intConstants, boolean[] boolConstants) {
-        return new Run(shader, inputRegisters, floatConstants, intConstants, boolConstants).execute(mainOffset);
+        return runDetailed(shader, mainOffset, inputRegisters, floatConstants, intConstants, boolConstants).output();
+    }
+
+    /// Como {@link #run}, mas também expõe as condition codes (`cmp.x`/`cmp.y`) gravadas por
+    /// `CMP` — nenhum consumidor real lê essas condition codes ainda (não há `JMPC`/`IFC`/`BREAKC`
+    /// implementados), então este método existe hoje só para permitir teste automatizado do
+    /// efeito observável de `CMP` (RFC/protocolo: "todo comportamento observável novo precisa de
+    /// teste automatizado").
+    public static Result runDetailed(ShaderBinary shader, int mainOffset, float[][] inputRegisters,
+                                      float[][] floatConstants, int[][] intConstants, boolean[] boolConstants) {
+        Run run = new Run(shader, inputRegisters, floatConstants, intConstants, boolConstants);
+        float[][] output = run.execute(mainOffset);
+        return new Result(output, run.conditionCode.clone());
+    }
+
+    /// `conditionCode[0]` = `cmp.x`, `conditionCode[1]` = `cmp.y` (3dbrew: registradores de
+    /// condição de 1 bit cada, gravados por `CMP` e lidos por `JMPC`/`IFC`/`BREAKC` — nenhum dos
+    /// três implementado ainda).
+    public record Result(float[][] output, boolean[] conditionCode) {
     }
 
     private static final class Run {
@@ -90,6 +121,7 @@ public final class VertexShaderInterpreter {
         private final boolean[] boolConstants;
         private final int[] addressRegister = new int[2]; // a0.x, a0.y
         private final int loopCounter = 0; // aL — LOOP não implementado nesta PR (ver Javadoc da classe)
+        private final boolean[] conditionCode = new boolean[2]; // cmp.x, cmp.y — gravado por CMP
 
         Run(ShaderBinary shader, float[][] input, float[][] floatConstants, int[][] intConstants,
             boolean[] boolConstants) {
@@ -123,8 +155,29 @@ public final class VertexShaderInterpreter {
 
         /// Executa uma instrução; retorna `true` se o programa terminou (`END`), `null`/`false`
         /// caso contrário. Efeito colateral: define {@link #nextPc}.
+        // nihstro shader_bytecode.h: "MAD = 0x38, // lower 3 opcode bits ignored" / "MADI = 0x30"
+        // / "CMP = 0x2E, // LSB opcode bit ignored" — os bits "ignorados" na identificação são,
+        // na verdade, dados reais (parte do registrador de destino do MAD, cmp.x do CMP), então o
+        // despacho é por FAIXA de opcode, e os handlers relêem esses bits do word bruto (nunca do
+        // valor de opcode já mascarado por este dispatch).
+        private static final int OPCODE_CMP = 0x2E;
+        private static final int OPCODE_MADI = 0x30;
+        private static final int OPCODE_MAD = 0x38;
+
         private Boolean step(int opcode, int word, int pc) {
             nextPc = pc + 1;
+            if (opcode >= OPCODE_MAD) {
+                multiplyAdd(word, false);
+                return Boolean.FALSE;
+            }
+            if (opcode >= OPCODE_MADI) {
+                multiplyAdd(word, true);
+                return Boolean.FALSE;
+            }
+            if (opcode == OPCODE_CMP || opcode == OPCODE_CMP + 1) {
+                compare(word);
+                return Boolean.FALSE;
+            }
             switch (opcode) {
                 case 0x00 -> format1(word, Run::add);
                 case 0x01 -> format1Reduce(word, Run::dot3);
@@ -172,8 +225,8 @@ public final class VertexShaderInterpreter {
             int src1Index = bits(word, 12, 7);
             int idx1 = bits(word, 19, 2);
             int dst = bits(word, 21, 5);
-            float[] src1 = readSource(src1Index, idx1, operandDescriptors[desc], true);
-            float[] src2 = readSource(src2Index, 0, operandDescriptors[desc], false);
+            float[] src1 = readSource(src1Index, idx1, operandDescriptors[desc], OPERAND_SRC1);
+            float[] src2 = readSource(src2Index, 0, operandDescriptors[desc], OPERAND_SRC2);
             writeDest(dst, operandDescriptors[desc], op.apply(src1, src2));
         }
 
@@ -189,7 +242,7 @@ public final class VertexShaderInterpreter {
             int src1Index = bits(word, 12, 7);
             int idx1 = bits(word, 19, 2);
             int dst = bits(word, 21, 5);
-            float[] src1 = readSource(src1Index, idx1, operandDescriptors[desc], true);
+            float[] src1 = readSource(src1Index, idx1, operandDescriptors[desc], OPERAND_SRC1);
             writeDest(dst, operandDescriptors[desc], op.apply(src1));
         }
 
@@ -197,7 +250,7 @@ public final class VertexShaderInterpreter {
             int desc = bits(word, 0, 7);
             int src1Index = bits(word, 12, 7);
             int idx1 = bits(word, 19, 2);
-            float[] src1 = readSource(src1Index, idx1, operandDescriptors[desc], true);
+            float[] src1 = readSource(src1Index, idx1, operandDescriptors[desc], OPERAND_SRC1);
             int descriptor = operandDescriptors[desc];
             int dstMask = bits(descriptor, 0, 4);
             if ((dstMask & 0b1000) != 0) {
@@ -208,7 +261,18 @@ public final class VertexShaderInterpreter {
             }
         }
 
-        private float[] readSource(int registerIndex, int addressSelector, int descriptor, boolean isSrc1) {
+        // Slot do operando dentro do descritor de swizzle/negate (3dbrew "SwizzlePattern"/nihstro
+        // `union SwizzlePattern`, validado contra o código-fonte real do nihstro nesta sessão —
+        // ver Javadoc da classe): cada slot tem seu próprio bit de negação e seletor de 8 bits.
+        // `OPERAND_SRC3` só é usado por `MAD`/`MADI` (formato 5/5i); formato 1/1u/1c usam só
+        // `SRC1`/`SRC2`.
+        private static final int OPERAND_SRC1 = 0;
+        private static final int OPERAND_SRC2 = 1;
+        private static final int OPERAND_SRC3 = 2;
+        private static final int[] OPERAND_NEGATE_BIT = {4, 13, 22};
+        private static final int[] OPERAND_SELECTOR_SHIFT = {5, 14, 23};
+
+        private float[] readSource(int registerIndex, int addressSelector, int descriptor, int operandSlot) {
             int effectiveIndex = registerIndex;
             if (addressSelector != 0 && registerIndex >= CONST_BASE) {
                 int offset = switch (addressSelector) {
@@ -222,11 +286,80 @@ public final class VertexShaderInterpreter {
                 }
             }
             float[] raw = readRegister(effectiveIndex);
-            int selectorShift = isSrc1 ? 5 : 14;
-            int selector = bits(descriptor, selectorShift, 8);
-            boolean negate = ((descriptor >>> (isSrc1 ? 4 : 13)) & 1) != 0;
+            int selector = bits(descriptor, OPERAND_SELECTOR_SHIFT[operandSlot], 8);
+            boolean negate = ((descriptor >>> OPERAND_NEGATE_BIT[operandSlot]) & 1) != 0;
             float[] swizzled = swizzle(raw, selector);
             return negate ? negate(swizzled) : swizzled;
+        }
+
+        // Formato 1c (3dbrew/nihstro `union CompareOpType`): opcode `0x2E`/`0x2F`, mesmo layout de
+        // src1/src2/idx do formato 1 comum, mas os bits 21-26 (que no formato 1 seriam `dest`) são
+        // dois campos de 3 bits (`cmp.y`=21-23, `cmp.x`=24-26) — sem registrador de destino normal,
+        // o resultado vai para as condition codes `cmp.x`/`cmp.y` (ver {@link Result#conditionCode}).
+        private static final int COMPARE_EQUAL = 0;
+        private static final int COMPARE_NOT_EQUAL = 1;
+        private static final int COMPARE_LESS_THAN = 2;
+        private static final int COMPARE_LESS_EQUAL = 3;
+        private static final int COMPARE_GREATER_THAN = 4;
+        private static final int COMPARE_GREATER_EQUAL = 5;
+
+        private void compare(int word) {
+            int desc = bits(word, 0, 7);
+            int src2Index = bits(word, 7, 5);
+            int src1Index = bits(word, 12, 7);
+            int idx1 = bits(word, 19, 2);
+            int opY = bits(word, 21, 3);
+            int opX = bits(word, 24, 3);
+            int descriptor = operandDescriptors[desc];
+            float[] src1 = readSource(src1Index, idx1, descriptor, OPERAND_SRC1);
+            float[] src2 = readSource(src2Index, 0, descriptor, OPERAND_SRC2);
+            conditionCode[0] = compareComponent(opX, src1[0], src2[0]);
+            conditionCode[1] = compareComponent(opY, src1[1], src2[1]);
+        }
+
+        private static boolean compareComponent(int op, float a, float b) {
+            return switch (op) {
+                case COMPARE_EQUAL -> a == b;
+                case COMPARE_NOT_EQUAL -> a != b;
+                case COMPARE_LESS_THAN -> a < b;
+                case COMPARE_LESS_EQUAL -> a <= b;
+                case COMPARE_GREATER_THAN -> a > b;
+                case COMPARE_GREATER_EQUAL -> a >= b;
+                default -> throw new UnsupportedOperationException(
+                        "operador de comparação reservado (0x6/0x7) do CMP do PICA200: " + op);
+            };
+        }
+
+        // Formato 5/5i (3dbrew/nihstro `union Instruction::mad` — validado contra o código-fonte
+        // real, não o wiki): 3 operandos, descritor de operando de só 5 bits (mesma tabela de
+        // operandDescriptors do formato 1, só que MAD convencionalmente usa índices < 32 — ver
+        // Javadoc da classe). `inverted=false` (opcode `MAD`, `0x38`-`0x3F`): src1 em bits(17,5),
+        // src2 "largo" (7 bits, pode referenciar uniform) em bits(10,7), src3 "estreito" (5 bits)
+        // em bits(5,5) — endereçamento relativo (`idx`) se aplica ao operando largo, aqui src2.
+        // `inverted=true` (opcode `MADI`, `0x30`-`0x37`): src1 continua igual; src2 vira estreito
+        // (5 bits) em bits(12,5); src3 vira o largo (7 bits) em bits(5,7) — `idx` passa a se
+        // aplicar a src3.
+        private void multiplyAdd(int word, boolean inverted) {
+            int desc = bits(word, 0, 5);
+            int src1Index = bits(word, 17, 5);
+            int src2Index = inverted ? bits(word, 12, 5) : bits(word, 10, 7);
+            int src3Index = inverted ? bits(word, 5, 7) : bits(word, 5, 5);
+            int idx = bits(word, 22, 2);
+            int dst = bits(word, 24, 5);
+            int descriptor = operandDescriptors[desc];
+            float[] src1 = readSource(src1Index, 0, descriptor, OPERAND_SRC1);
+            float[] src2 = readSource(src2Index, inverted ? 0 : idx, descriptor, OPERAND_SRC2);
+            float[] src3 = readSource(src3Index, inverted ? idx : 0, descriptor, OPERAND_SRC3);
+            writeDest(dst, descriptor, multiplyAdd(src1, src2, src3));
+        }
+
+        private static float[] multiplyAdd(float[] a, float[] b, float[] c) {
+            return new float[]{
+                    Math.fma(a[0], b[0], c[0]),
+                    Math.fma(a[1], b[1], c[1]),
+                    Math.fma(a[2], b[2], c[2]),
+                    Math.fma(a[3], b[3], c[3])
+            };
         }
 
         private float[] readRegister(int index) {
