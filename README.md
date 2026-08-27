@@ -148,3 +148,9 @@ detalhes sobre este e outros projetos. Contato: vitor.silverio.rodrigues@gmail.c
 ## Licença
 
 BSD 3-Clause — ver [LICENSE](LICENSE).
+
+**Fonte de terceiros embutida**: `src/main/resources/fonts/NotoSans.ttf` (usada por
+`APT:GetSharedFont`, ver `SharedFontGenerator`) é a fonte **Noto Sans**, licenciada sob a
+[SIL Open Font License 1.1](src/main/resources/fonts/OFL.txt) — a OFL permite embutir/distribuir
+a fonte junto de software sob outra licença sem exigir copyleft, então isto não afeta a licença
+BSD 3-Clause do restante do projeto.

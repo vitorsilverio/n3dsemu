@@ -42,7 +42,7 @@ class AptServiceTest {
         PagedAddressSpace memory = new PagedAddressSpace(PAGE_SHIFT, new LoggingOpenBus(log));
         memory.mapRam(BUFFER_ADDRESS & ~0xFFF, new byte[1 << PAGE_SHIFT]);
         HandleTable handles = new HandleTable(new ProcessObject(0), ThreadObject.mainThread(1, 0x30));
-        return new Harness(memory, handles, new AptService(log, handles));
+        return new Harness(memory, handles, new AptService(log, memory, handles));
     }
 
     private void invoke(Harness h, int commandId, int normalParamCount, int... normalParams) {
@@ -127,5 +127,67 @@ class AptServiceTest {
         invoke(h, 0x9999, 0);
 
         assertEquals(Result.SERVICE_COMMAND_NOT_IMPLEMENTED.code(), result(h));
+    }
+
+    @Test
+    void inquireNotificationDevolveSucessoComSinalNenhum() {
+        Harness h = newHarness();
+        int CMD_INQUIRE_NOTIFICATION = 0xB;
+        int APTSIGNAL_NONE = 0;
+
+        invoke(h, CMD_INQUIRE_NOTIFICATION, 2, 0x300, 0);
+
+        assertEquals(Result.SUCCESS.code(), result(h));
+        assertEquals(APTSIGNAL_NONE, h.memory().read32(BUFFER_ADDRESS + 4 * 2));
+    }
+
+    @Test
+    void checkNew3dsDevolveFalsoParaOModeloOld3ds() {
+        Harness h = newHarness();
+        int CMD_CHECK_NEW_3DS = 0x102;
+
+        invoke(h, CMD_CHECK_NEW_3DS, 0);
+
+        assertEquals(Result.SUCCESS.code(), result(h));
+        assertEquals(0, h.memory().read32(BUFFER_ADDRESS + 4 * 2));
+    }
+
+    @Test
+    void getSharedFontMapeiaUmCfnuValidoEDevolveUmaHandleValida() {
+        Harness h = newHarness();
+        int CMD_GET_SHARED_FONT = 0x44;
+
+        invoke(h, CMD_GET_SHARED_FONT, 0);
+
+        assertEquals(Result.SUCCESS.code(), result(h));
+        int mapAddr = h.memory().read32(BUFFER_ADDRESS + 4 * 2);
+        assertNotEquals(0, mapAddr);
+        int fontHandle = h.memory().read32(BUFFER_ADDRESS + 4 * 4); // após result+mapAddr+descritor
+        assertNotEquals(0, fontHandle);
+        assertEquals(true, h.handles().resolve(fontHandle).isPresent());
+
+        // 3dbrew BCFNT: magic muda de "CFNT" para "CFNU" na cópia mapeada em memória.
+        int cfntMagicOffset = 0x80;
+        assertEquals((int) 'C', h.memory().read8(mapAddr + cfntMagicOffset));
+        assertEquals((int) 'F', h.memory().read8(mapAddr + cfntMagicOffset + 1));
+        assertEquals((int) 'N', h.memory().read8(mapAddr + cfntMagicOffset + 2));
+        assertEquals((int) 'U', h.memory().read8(mapAddr + cfntMagicOffset + 3));
+    }
+
+    @Test
+    void getSharedFontChamadoDuasVezesDevolveOMesmoEndereco() {
+        Harness h = newHarness();
+        int CMD_GET_SHARED_FONT = 0x44;
+
+        invoke(h, CMD_GET_SHARED_FONT, 0);
+        int firstAddr = h.memory().read32(BUFFER_ADDRESS + 4 * 2);
+        int firstHandle = h.memory().read32(BUFFER_ADDRESS + 4 * 4);
+
+        invoke(h, CMD_GET_SHARED_FONT, 0);
+        int secondAddr = h.memory().read32(BUFFER_ADDRESS + 4 * 2);
+        int secondHandle = h.memory().read32(BUFFER_ADDRESS + 4 * 4);
+
+        assertEquals(firstAddr, secondAddr);
+        assertEquals(firstHandle, secondHandle);
     }
 }

@@ -48,6 +48,16 @@ public final class MemoryMap {
     public static final int LINEAR_HEAP_BASE = 0x1400_0000;
     public static final int LINEAR_HEAP_SIZE = HEAP_POOL_SIZE;
 
+    /// Fonte compartilhada do sistema (`APT:GetSharedFont`, ver `AptService`/`SharedFontGenerator`,
+    /// task G6.5) — endereço fixo escolhido no vão livre entre {@link #LINEAR_HEAP_BASE} (termina
+    /// em `0x1500_0000`) e {@link #VRAM_BASE}. **Não é um valor tabulado pelo 3dbrew**: no
+    /// hardware real a fonte é relocada dinamicamente para dentro do heap linear do PRÓPRIO
+    /// processo (o kernel escaneia o espaço de endereçamento com `svcQueryMemory` procurando um
+    /// buraco do tamanho certo — ver `APTInterface::GetSharedFont` real do `lime3ds`); sem MMU
+    /// nesta HLE (RFC D2), um endereço fixo dedicado é equivalente em comportamento observável
+    /// (o guest só lê `mapAddr` da resposta IPC, nunca presume o valor).
+    public static final int SHARED_FONT_BASE = 0x1500_0000;
+
     /// VRAM: 2 bancos de 3 MiB (RFC §3/D6).
     public static final int VRAM_BASE = 0x1800_0000;
     /// Endereço VIRTUAL da mesma VRAM (`OS_VRAM_VADDR` do libctru real, `os.h`) — é por aqui que

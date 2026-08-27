@@ -141,7 +141,7 @@ public final class N3dsMachine {
         HidService hidService = new HidService(diagnosticLog, memory, handles, inputState, inputScript);
         GspGpuService gspGpuService = new GspGpuService(diagnosticLog, memory, handles, scheduler, hidService, renderer);
         serviceRegistry.register(new SrvService(diagnosticLog, handles, serviceRegistry));
-        AptService aptService = new AptService(diagnosticLog, handles);
+        AptService aptService = new AptService(diagnosticLog, memory, handles);
         serviceRegistry.register(aptService);
         // aptInit real (libctru) abre 3 sessões (APT:U/APT:S/APT:A) para o mesmo serviço do
         // lado do sistema — sem os aliases, GetServiceHandle("APT:S") falhava e aptInit
