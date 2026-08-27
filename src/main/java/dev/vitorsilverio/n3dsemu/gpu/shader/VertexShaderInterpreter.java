@@ -1,5 +1,8 @@
 package dev.vitorsilverio.n3dsemu.gpu.shader;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
+
 /// Interpretador da ISA de vertex shader do PICA200 (RFC-N3DSEMU G5/D5: "interpretar na CPU" —
 /// decisão explícita, sem JIT de shader nesta task).
 ///
@@ -27,13 +30,22 @@ package dev.vitorsilverio.n3dsemu.gpu.shader;
 /// `switch` do formato 1, e relendo os bits de volta do word bruto dentro de cada handler (nunca
 /// do valor de opcode já decodificado).
 ///
+/// **G6.4 acrescentou o controle de fluxo completo** (`JMPC`/`JMPU`/`IFC`/`IFU`/`CALL`/`CALLC`/
+/// `CALLU`/`LOOP`/`BREAK`/`BREAKC`, formatos 2/3/4/6 do 3dbrew) — layout de bits do nihstro
+/// (`union Instruction::FlowControlType`) e SEMÂNTICA de pilha (3 pilhas: `IF`/`CALL`/`LOOP`)
+/// transcrita fielmente do interpretador de referência real do Citra
+/// (`src/video_core/shader/shader_interpreter.cpp`, função `RunInterpreter`, obtido via `curl` do
+/// fork <a href="https://github.com/lime3ds/lime3ds">lime3ds</a> — o `citra-emu/citra` original
+/// não existe mais nesse caminho). O layout de bits sozinho não bastava aqui (diferente de
+/// `CMP`/`MAD`): a ordem de checagem das 3 pilhas a cada instrução (`CALL`→`IF`→`LOOP`), o uso do
+/// endereço de "queda natural" (`pc+1`, ignorando qualquer salto que a própria instrução acabou de
+/// fazer) para decidir fim de escopo, e o truque de paridade do `JMPU` (bit 0 de `num_instructions`
+/// como flag de inversão) são comportamento real do hardware, não deriváveis só dos nomes dos
+/// campos — ver a task `g6.4-vertex-shader-controle-de-fluxo.md` para o detalhe completo.
+///
 /// **Ainda não implementados** (lançam `UnsupportedOperationException`): `DST`/`LITP` (formato 1,
-/// mas semântica especial), o formato **1i** (`DPHI`/`DSTI`/`SGEI`/`SLTI`) e todo o controle de
-/// fluxo (`CALL`/`IFU`/`IFC`/`LOOP`/`JMPC`/`JMPU`/`BREAK`/`BREAKC`) — `CMP` grava em `cmp.x`/`cmp.y`
-/// (ver {@link Result#conditionCode()}), mas nada ainda LÊ essas condition codes (não há `JMPC`/
-/// `IFC`/`BREAKC`), então o efeito observável de `CMP` hoje é só o valor exposto por
-/// {@link #runDetailed}. Candidatos a uma PR de extensão quando um consumidor real (ex.:
-/// `textured_cube`, que usa laços/condicionais) aparecer.
+/// mas semântica especial), o formato **1i** (`DPHI`/`DSTI`/`SGEI`/`SLTI`) e `EMIT`/`SETEMIT`
+/// (formato 4, só usado por geometry shader — este interpretador só roda vertex shader, RFC D1).
 public final class VertexShaderInterpreter {
     public static final int NUM_INPUT_REGISTERS = 16;
     public static final int NUM_TEMP_REGISTERS = 16;
@@ -105,9 +117,38 @@ public final class VertexShaderInterpreter {
     }
 
     /// `conditionCode[0]` = `cmp.x`, `conditionCode[1]` = `cmp.y` (3dbrew: registradores de
-    /// condição de 1 bit cada, gravados por `CMP` e lidos por `JMPC`/`IFC`/`BREAKC` — nenhum dos
-    /// três implementado ainda).
+    /// condição de 1 bit cada, gravados por `CMP` e lidos por `JMPC`/`IFC`/`CALLC`/`BREAKC`, ver
+    /// G6.4).
     public record Result(float[][] output, boolean[] conditionCode) {
+    }
+
+    /// Escopo de `CALL`/`CALLC`/`CALLU` pendente (G6.4) — 3dbrew/Citra `CallStackElement`.
+    private record CallStackElement(int endAddress, int returnAddress) {
+    }
+
+    /// Escopo de `IFC`/`IFU` pendente (G6.4) — 3dbrew/Citra `IfStackElement`. `elseAddress` é onde
+    /// o bloco "senão" (ou o fim, se não houver "senão") começa; `endAddress` é o fim do bloco
+    /// inteiro (`then`+`else`).
+    private record IfStackElement(int elseAddress, int endAddress) {
+    }
+
+    /// Escopo de `LOOP` pendente (G6.4) — 3dbrew/Citra `LoopStackElement`. `loopDownCounter` é
+    /// mutável (decrementado a cada iteração); os outros campos são fixos no momento do `LOOP`.
+    private static final class LoopStackElement {
+        private final int entryAddress;
+        private final int endAddress;
+        private int loopDownCounter;
+        private final int addressIncrement;
+        private final int previousAl;
+
+        LoopStackElement(int entryAddress, int endAddress, int loopDownCounter, int addressIncrement,
+                          int previousAl) {
+            this.entryAddress = entryAddress;
+            this.endAddress = endAddress;
+            this.loopDownCounter = loopDownCounter;
+            this.addressIncrement = addressIncrement;
+            this.previousAl = previousAl;
+        }
     }
 
     private static final class Run {
@@ -120,8 +161,15 @@ public final class VertexShaderInterpreter {
         private final int[][] intConstants;
         private final boolean[] boolConstants;
         private final int[] addressRegister = new int[2]; // a0.x, a0.y
-        private final int loopCounter = 0; // aL — LOOP não implementado nesta PR (ver Javadoc da classe)
+        private int addressRegisterAl; // aL — terceiro registrador de endereço, gravado por LOOP (G6.4)
         private final boolean[] conditionCode = new boolean[2]; // cmp.x, cmp.y — gravado por CMP
+        // 3 pilhas de controle de fluxo (G6.4) — mesma estrutura do Citra `RunInterpreter`, sem
+        // limite de profundidade (Citra usa `boost::circular_buffer` de 4/8/4; nenhum consumidor
+        // real do corpus atual chega perto desses limites, ver "Não inclui" da task).
+        private final Deque<CallStackElement> callStack = new ArrayDeque<>();
+        private final Deque<IfStackElement> ifStack = new ArrayDeque<>();
+        private final Deque<LoopStackElement> loopStack = new ArrayDeque<>();
+        private boolean isBreak; // marcado por BREAK/BREAKC nesta instrução; consumido pela pilha de LOOP
 
         Run(ShaderBinary shader, float[][] input, float[][] floatConstants, int[][] intConstants,
             boolean[] boolConstants) {
@@ -139,16 +187,67 @@ public final class VertexShaderInterpreter {
                 if (pc < 0 || pc >= code.length) {
                     return output;
                 }
+                int oldPc = pc;
                 int word = code[pc];
                 int opcode = (word >>> 26) & 0x3F;
-                Boolean halted = step(opcode, word, pc);
+                isBreak = false;
+                Boolean halted = step(opcode, word, oldPc);
                 if (halted != null && halted) {
                     return output;
                 }
-                pc = nextPc;
+                pc = resolveNextPc(oldPc, nextPc);
             }
             throw new IllegalStateException("vertex shader excedeu " + MAX_STEPS
                     + " passos — programa malformado ou laço infinito");
+        }
+
+        /// Processamento de pilha executado APÓS toda instrução, independente do opcode (Citra
+        /// `RunInterpreter`, comentário original: "Stacks are checked in the order CALL -> IF ->
+        /// LOOP"). `fallthrough` (queda natural, ignorando qualquer salto que a própria instrução
+        /// acabou de fazer) decide fim de escopo — não o `tentativeNextPc` já calculado pelo
+        /// despacho da instrução, que serve só de valor-base a ser possivelmente sobrescrito aqui.
+        private int resolveNextPc(int oldPc, int tentativeNextPc) {
+            int result = tentativeNextPc;
+            int fallthrough = oldPc + 1;
+
+            int probe = fallthrough;
+            for (int i = 0; i < 4; i++) {
+                CallStackElement top = callStack.peek();
+                if (top == null || top.endAddress() != probe) {
+                    break;
+                }
+                // "Bug de hardware" real (Citra): ao fechar 4 escopos CALL de uma vez, o último
+                // não atualiza o pc — replicado fielmente, não é um erro de tradução.
+                if (i < 3) {
+                    result = top.returnAddress();
+                    probe = result;
+                }
+                callStack.pop();
+            }
+
+            IfStackElement ifTop = ifStack.peek();
+            if (ifTop != null && ifTop.elseAddress() == fallthrough) {
+                result = ifTop.endAddress();
+                ifStack.pop();
+            }
+
+            LoopStackElement loopTop = loopStack.peek();
+            if (loopTop != null && (loopTop.endAddress == fallthrough || isBreak)) {
+                addressRegisterAl += loopTop.addressIncrement;
+                int oldCounter = loopTop.loopDownCounter;
+                loopTop.loopDownCounter = (oldCounter - 1) & 0xFF; // decremento não-saturante (u8)
+                if (!isBreak && oldCounter != 0) {
+                    result = loopTop.entryAddress;
+                } else {
+                    result = loopTop.endAddress;
+                    if (loopStack.size() > 1) {
+                        addressRegisterAl = loopTop.previousAl;
+                    }
+                    loopStack.pop();
+                }
+            }
+
+            return result;
         }
 
         private int nextPc;
@@ -163,6 +262,19 @@ public final class VertexShaderInterpreter {
         private static final int OPCODE_CMP = 0x2E;
         private static final int OPCODE_MADI = 0x30;
         private static final int OPCODE_MAD = 0x38;
+
+        // Controle de fluxo (G6.4), formatos 2/3/4/6 do 3dbrew — identificados pelo opcode de 6
+        // bits normal (bits 26-31), sem bits "ignorados" (diferente de CMP/MAD/MADI).
+        private static final int OPCODE_BREAK = 0x20;
+        private static final int OPCODE_BREAKC = 0x23;
+        private static final int OPCODE_CALL = 0x24;
+        private static final int OPCODE_CALLC = 0x25;
+        private static final int OPCODE_CALLU = 0x26;
+        private static final int OPCODE_IFU = 0x27;
+        private static final int OPCODE_IFC = 0x28;
+        private static final int OPCODE_LOOP = 0x29;
+        private static final int OPCODE_JMPC = 0x2C;
+        private static final int OPCODE_JMPU = 0x2D;
 
         private Boolean step(int opcode, int word, int pc) {
             nextPc = pc + 1;
@@ -201,10 +313,107 @@ public final class VertexShaderInterpreter {
                 case 0x21 -> {
                     // NOP
                 }
+                case OPCODE_BREAK -> isBreak = true;
+                case OPCODE_BREAKC -> {
+                    if (evaluateCondition(word)) {
+                        isBreak = true;
+                    }
+                }
+                case OPCODE_JMPC -> {
+                    if (evaluateCondition(word)) {
+                        nextPc = bits(word, 10, 12);
+                    }
+                }
+                case OPCODE_JMPU -> {
+                    int numInstructions = bits(word, 0, 8);
+                    int boolUniformId = bits(word, 22, 4);
+                    boolean invert = (numInstructions & 1) != 0;
+                    if (boolConstants[boolUniformId] == !invert) {
+                        nextPc = bits(word, 10, 12);
+                    }
+                }
+                case OPCODE_CALL -> doCall(word, pc);
+                case OPCODE_CALLC -> {
+                    if (evaluateCondition(word)) {
+                        doCall(word, pc);
+                    }
+                }
+                case OPCODE_CALLU -> {
+                    int boolUniformId = bits(word, 22, 4);
+                    if (boolConstants[boolUniformId]) {
+                        doCall(word, pc);
+                    }
+                }
+                case OPCODE_IFC -> doIf(word, evaluateCondition(word));
+                case OPCODE_IFU -> {
+                    int boolUniformId = bits(word, 22, 4);
+                    doIf(word, boolConstants[boolUniformId]);
+                }
+                case OPCODE_LOOP -> doLoop(word, pc);
                 default -> throw new UnsupportedOperationException(
                         "opcode de vertex shader não implementado: 0x" + Integer.toHexString(opcode));
             }
             return Boolean.FALSE;
+        }
+
+        // Avaliação de condição (3dbrew/nihstro `union FlowControlType`, `evaluate_condition` do
+        // Citra): combina cmp.x/cmp.y (gravados por CMP) via AND/OR/JustX/JustY, cada lado
+        // invertido por refx/refy. Compartilhada por JMPC/IFC/CALLC/BREAKC.
+        private static final int FLOW_OP_OR = 0;
+        private static final int FLOW_OP_AND = 1;
+        private static final int FLOW_OP_JUST_X = 2;
+        private static final int FLOW_OP_JUST_Y = 3;
+
+        private boolean evaluateCondition(int word) {
+            int op = bits(word, 22, 2);
+            boolean refy = ((word >>> 24) & 1) != 0;
+            boolean refx = ((word >>> 25) & 1) != 0;
+            boolean resultX = refx == conditionCode[0];
+            boolean resultY = refy == conditionCode[1];
+            return switch (op) {
+                case FLOW_OP_OR -> resultX || resultY;
+                case FLOW_OP_AND -> resultX && resultY;
+                case FLOW_OP_JUST_X -> resultX;
+                case FLOW_OP_JUST_Y -> resultY;
+                default -> throw new IllegalStateException("op de 2 bits fora do intervalo 0-3: " + op);
+            };
+        }
+
+        /// `CALL`/`CALLC`/`CALLU` (3dbrew/nihstro formato 2/3, Citra `do_call`): empilha o retorno
+        /// e desvia para `dest_offset`; o fim do escopo (e o retorno de verdade) é resolvido por
+        /// {@link #resolveNextPc} quando o `pc` cai em `endAddress`.
+        private void doCall(int word, int pc) {
+            int destOffset = bits(word, 10, 12);
+            int numInstructions = bits(word, 0, 8);
+            callStack.push(new CallStackElement(destOffset + numInstructions, pc + 1));
+            nextPc = destOffset;
+        }
+
+        /// `IFC`/`IFU` (Citra `do_if`): se a condição é verdadeira, empilha o escopo do bloco
+        /// "então" (o "senão" — se houver — é pulado por {@link #resolveNextPc} ao alcançar
+        /// `elseAddress`); se falsa, desvia direto para `elseAddress` (não empilha nada — não há
+        /// bloco a fechar).
+        private void doIf(int word, boolean condition) {
+            int destOffset = bits(word, 10, 12);
+            int numInstructions = bits(word, 0, 8);
+            if (condition) {
+                ifStack.push(new IfStackElement(destOffset, destOffset + numInstructions));
+            } else {
+                nextPc = destOffset;
+            }
+        }
+
+        /// `LOOP` (Citra `do_loop`): `int_uniform_id` indexa uma constante inteira de 4 componentes
+        /// (`x`=contador de iterações, `y`=valor inicial de `aL`, `z`=incremento de `aL`, `w` não
+        /// usado) — grava `aL` e empilha o escopo; a iteração/saída do laço é resolvida por
+        /// {@link #resolveNextPc}.
+        private void doLoop(int word, int pc) {
+            int destOffset = bits(word, 10, 12);
+            int intUniformId = bits(word, 22, 2);
+            int[] loopParam = intConstants[intUniformId];
+            int previousAl = addressRegisterAl;
+            loopStack.push(new LoopStackElement(pc + 1, destOffset + 1, loopParam[0], loopParam[2], previousAl));
+            addressRegisterAl = loopParam[1];
         }
 
         private interface BinaryOp {
@@ -278,7 +487,7 @@ public final class VertexShaderInterpreter {
                 int offset = switch (addressSelector) {
                     case 1 -> addressRegister[0];
                     case 2 -> addressRegister[1];
-                    case 3 -> loopCounter;
+                    case 3 -> addressRegisterAl;
                     default -> 0;
                 };
                 if (offset >= -128 && offset <= 127) {

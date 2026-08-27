@@ -214,4 +214,210 @@ class VertexShaderInterpreterTest {
         assertEquals(140f, output[1][2], 1e-6f);
         assertEquals(150f, output[1][3], 1e-6f);
     }
+
+    // --- G6.4: controle de fluxo (JMPC/JMPU/IFC/IFU/CALL*/LOOP/BREAK*) ----------------------
+    //
+    // Layout de bits + semântica de pilha transcritos do nihstro (`shader_bytecode.h`) e do
+    // interpretador de referência real do Citra (`shader_interpreter.cpp`, fork lime3ds, `curl`
+    // direto — ver Javadoc de `VertexShaderInterpreter` e a task `g6.4-...md`). Sem `.shbin` real
+    // disponível que use laços/condicionais — programas sintéticos, words calculados via shift.
+
+    private static int movWord(int srcIndex, int destIndex) {
+        // MOV (0x13, format1u): desc=0 (identidade), src1 em bits(12,7), dest em bits(21,5).
+        return (0x13 << 26) | (destIndex << 21) | (srcIndex << 12);
+    }
+
+    private static int endWord() {
+        return 0x22 << 26;
+    }
+
+    /// `JMPC` (`0x2C`): `dest_offset` em bits(10,12), `op`/`refx`/`refy` em bits(22,2)/25/24 —
+    /// mesmo layout de `FlowControlType`. `op=JustX(2)`, `refx=1`: salta se `cmp.x==true`.
+    private static int jmpcWord(int destOffset, int op, boolean refx, boolean refy) {
+        return (0x2C << 26) | (destOffset << 10) | (op << 22) | ((refy ? 1 : 0) << 24) | ((refx ? 1 : 0) << 25);
+    }
+
+    private static int cmpWord(int src1Index, int src2Index, int opX, int opY) {
+        return (src2Index << 7) | (src1Index << 12) | (opY << 21) | (opX << 24) | (0b10111 << 27);
+    }
+
+    @Test
+    void jmpcTakesBranchWhenConditionMatchesAndSkipsInstructionsInBetween() {
+        // v0->o0 (não deveria rodar, pulado pelo salto); v1->o1 (destino do salto); END.
+        ShaderBinary shader = syntheticShader(
+                cmpWord(0, 1, 2 /*LessThan*/, 2 /*LessThan*/), // pc0: cmp v0,v1 (x,y ambos LessThan)
+                jmpcWord(3, 2 /*JustX*/, true, false),          // pc1: jmpc pc3 se cmp.x==true
+                movWord(0, 0),                                  // pc2: mov o0,v0 (deveria ser pulado)
+                movWord(1, 1),                                  // pc3: mov o1,v1 (destino do salto)
+                endWord());                                     // pc4
+
+        float[][] input = new float[VertexShaderInterpreter.NUM_INPUT_REGISTERS][4];
+        input[0] = new float[]{1f, 1f, 1f, 1f}; // v0 < v1 -> cmp.x = true
+        input[1] = new float[]{9f, 9f, 9f, 9f};
+
+        float[][] output = VertexShaderInterpreter.run(shader, 0, input,
+                new float[VertexShaderInterpreter.NUM_FLOAT_CONSTANTS][4],
+                new int[VertexShaderInterpreter.NUM_INT_CONSTANTS][4],
+                new boolean[VertexShaderInterpreter.NUM_BOOL_CONSTANTS]);
+
+        assertEquals(0f, output[0][0], 1e-6f, "o0 não deveria ter sido escrito (instrução pulada)");
+        assertEquals(9f, output[1][0], 1e-6f, "o1 deveria ter recebido v1 no destino do salto");
+    }
+
+    @Test
+    void jmpcDoesNotBranchWhenConditionDoesNotMatch() {
+        ShaderBinary shader = syntheticShader(
+                cmpWord(0, 1, 4 /*GreaterThan*/, 4 /*GreaterThan*/), // v0 > v1? falso
+                jmpcWord(3, 2 /*JustX*/, true, false),
+                movWord(0, 0), // deve rodar (não pulado)
+                movWord(1, 1),
+                endWord());
+
+        float[][] input = new float[VertexShaderInterpreter.NUM_INPUT_REGISTERS][4];
+        input[0] = new float[]{1f, 1f, 1f, 1f};
+        input[1] = new float[]{9f, 9f, 9f, 9f};
+
+        float[][] output = VertexShaderInterpreter.run(shader, 0, input,
+                new float[VertexShaderInterpreter.NUM_FLOAT_CONSTANTS][4],
+                new int[VertexShaderInterpreter.NUM_INT_CONSTANTS][4],
+                new boolean[VertexShaderInterpreter.NUM_BOOL_CONSTANTS]);
+
+        assertEquals(1f, output[0][0], 1e-6f, "o0 deveria ter sido escrito (salto não tomado)");
+        assertEquals(9f, output[1][0], 1e-6f);
+    }
+
+    /// `IFC` (`0x28`): `num_instructions` em bits(0,8) = tamanho do bloco "então". Sem "senão"
+    /// aqui (`dest_offset` == `endAddress` do bloco "então", ou seja, cai direto no fim).
+    private static int ifcWord(int destOffset, int numInstructions, int op, boolean refx, boolean refy) {
+        return (0x28 << 26) | (numInstructions) | (destOffset << 10) | (op << 22)
+                | ((refy ? 1 : 0) << 24) | ((refx ? 1 : 0) << 25);
+    }
+
+    @Test
+    void ifcRunsThenBlockWhenConditionTrueAndSkipsItWhenFalse() {
+        // pc0: cmp; pc1: ifc (então: pc2, 1 instrução, dest_offset=3=fim); pc2: mov o0,v1; pc3: end.
+        ShaderBinary shader = syntheticShader(
+                cmpWord(0, 1, 2 /*LessThan*/, 2),
+                ifcWord(3, 1, 2 /*JustX*/, true, false),
+                movWord(1, 0), // então: o0 = v1
+                endWord());
+
+        float[][] input = new float[VertexShaderInterpreter.NUM_INPUT_REGISTERS][4];
+        input[0] = new float[]{1f, 1f, 1f, 1f};
+        input[1] = new float[]{9f, 9f, 9f, 9f};
+
+        float[][] trueOutput = VertexShaderInterpreter.run(shader, 0, input,
+                new float[VertexShaderInterpreter.NUM_FLOAT_CONSTANTS][4],
+                new int[VertexShaderInterpreter.NUM_INT_CONSTANTS][4],
+                new boolean[VertexShaderInterpreter.NUM_BOOL_CONSTANTS]);
+        assertEquals(9f, trueOutput[0][0], 1e-6f, "condição verdadeira: bloco então deveria ter rodado");
+
+        input[0] = new float[]{9f, 9f, 9f, 9f};
+        input[1] = new float[]{1f, 1f, 1f, 1f}; // agora v0 < v1 é falso
+        float[][] falseOutput = VertexShaderInterpreter.run(shader, 0, input,
+                new float[VertexShaderInterpreter.NUM_FLOAT_CONSTANTS][4],
+                new int[VertexShaderInterpreter.NUM_INT_CONSTANTS][4],
+                new boolean[VertexShaderInterpreter.NUM_BOOL_CONSTANTS]);
+        assertEquals(0f, falseOutput[0][0], 1e-6f, "condição falsa: bloco então deveria ter sido pulado");
+    }
+
+    /// `CALL` (`0x24`): `dest_offset` em bits(10,12) = alvo; `num_instructions` em bits(0,8) =
+    /// tamanho da sub-rotina (retorno = `dest_offset + num_instructions`).
+    private static int callWord(int destOffset, int numInstructions) {
+        return (0x24 << 26) | numInstructions | (destOffset << 10);
+    }
+
+    @Test
+    void callJumpsToSubroutineAndReturnsAfterIt() {
+        // pc0: call pc3 (sub-rotina de 1 instrução, pc3); pc1: mov o1,v1 (depois do retorno);
+        // pc2: end; pc3: mov o0,v0 (corpo da sub-rotina, único, retorno cai em pc0+1=pc1... não,
+        // retorno = dest_offset(3)+num_instructions(1)=4 -> cai em pc1? Não: end_address=4 é
+        // comparado contra fallthrough (pc3+1=4) -> fecha o escopo e usa returnAddress=pc0+1=pc1.
+        ShaderBinary shader = syntheticShader(
+                callWord(3, 1), // pc0
+                movWord(1, 1),  // pc1: depois do retorno
+                endWord(),      // pc2
+                movWord(0, 0)); // pc3: corpo da sub-rotina
+
+        float[][] input = new float[VertexShaderInterpreter.NUM_INPUT_REGISTERS][4];
+        input[0] = new float[]{5f, 5f, 5f, 5f};
+        input[1] = new float[]{7f, 7f, 7f, 7f};
+
+        float[][] output = VertexShaderInterpreter.run(shader, 0, input,
+                new float[VertexShaderInterpreter.NUM_FLOAT_CONSTANTS][4],
+                new int[VertexShaderInterpreter.NUM_INT_CONSTANTS][4],
+                new boolean[VertexShaderInterpreter.NUM_BOOL_CONSTANTS]);
+
+        assertEquals(5f, output[0][0], 1e-6f, "o0 deveria ter sido escrito dentro da sub-rotina");
+        assertEquals(7f, output[1][0], 1e-6f, "o1 deveria ter sido escrito depois do retorno da CALL");
+    }
+
+    /// `LOOP` (`0x29`): `int_uniform_id` em bits(22,2) indexa uma constante inteira
+    /// (`x`=contador,`y`=aL inicial,`z`=incremento). `dest_offset`+1 = endereço de saída do laço.
+    private static int loopWord(int destOffset, int intUniformId) {
+        return (0x29 << 26) | (destOffset << 10) | (intUniformId << 22);
+    }
+
+    private static final int TEMP_R0 = 16; // r0 — único registrador legível E gravável (o0-o15 são write-only)
+
+    /// `ADD` (formato 1, `0x00`): monta o word bit a bit (descritor `0`, identidade).
+    private static int bitsAdd(int src1Index, int src2Index, int destIndex) {
+        return (src2Index << 7) | (src1Index << 12) | (destIndex << 21);
+    }
+
+    @Test
+    void loopRepeatsBodyAccordingToIntUniformCounter() {
+        // Acumula v0 em r0 (temp — registrador de saída não é legível como fonte, mesmo padrão do
+        // PICA200 real) a cada iteração, depois copia r0->o0 fora do laço.
+        // int0 = {count=2 (contador é "N-1", roda 3x), initialAl=0, increment=1, unused=0}.
+        int addWord = bitsAdd(TEMP_R0, 0, TEMP_R0); // pc1: r0 += v0
+        ShaderBinary shader = syntheticShader(
+                loopWord(1, 0),          // pc0: loop dest_offset=1 -> endAddress=2 (=pc2), entry=pc1
+                addWord,                 // pc1: corpo do laço (única instrução)
+                movWord(TEMP_R0, 0),     // pc2: fora do laço — o0 = r0
+                endWord());              // pc3
+
+        float[][] input = new float[VertexShaderInterpreter.NUM_INPUT_REGISTERS][4];
+        input[0] = new float[]{1f, 1f, 1f, 1f};
+        int[][] intConstants = new int[VertexShaderInterpreter.NUM_INT_CONSTANTS][4];
+        intConstants[0] = new int[]{2, 0, 1, 0}; // downcounter=2 -> corpo roda 3x
+
+        float[][] output = VertexShaderInterpreter.run(shader, 0, input,
+                new float[VertexShaderInterpreter.NUM_FLOAT_CONSTANTS][4], intConstants,
+                new boolean[VertexShaderInterpreter.NUM_BOOL_CONSTANTS]);
+
+        assertEquals(3f, output[0][0], 1e-6f, "o0 deveria ter acumulado 3 iterações (contador=2 -> 3x)");
+    }
+
+    /// `BREAKC` (`0x23`): sai do laço mais interno assim que a condição é verdadeira, antes do
+    /// contador natural terminar.
+    private static int breakcWord(int op, boolean refx, boolean refy) {
+        return (0x23 << 26) | (op << 22) | ((refy ? 1 : 0) << 24) | ((refx ? 1 : 0) << 25);
+    }
+
+    @Test
+    void breakcExitsLoopEarlyBeforeNaturalCounterEnds() {
+        // Corpo: acumula r0+=v0, depois cmp (sempre verdadeiro) + breakc — a 1ª iteração acumula
+        // e então quebra, então mesmo com contador programado para 5 iterações só 1 deveria rodar.
+        int addWord = bitsAdd(TEMP_R0, 0, TEMP_R0);
+        ShaderBinary shader = syntheticShader(
+                loopWord(3, 0),                       // pc0: loop dest_offset=3 -> endAddress=4(=pc4), entry=pc1
+                addWord,                                // pc1: corpo — r0 += v0
+                cmpWord(0, 1, 2 /*LessThan*/, 2),      // pc2: cmp v0,v1 (sempre true: 1<9)
+                breakcWord(2 /*JustX*/, true, false),  // pc3: breakc se cmp.x==true (fallthrough==endAddress)
+                movWord(TEMP_R0, 0),                    // pc4: fora do laço — o0 = r0
+                endWord());                             // pc5
+
+        float[][] input = new float[VertexShaderInterpreter.NUM_INPUT_REGISTERS][4];
+        input[0] = new float[]{1f, 1f, 1f, 1f};
+        input[1] = new float[]{9f, 9f, 9f, 9f};
+        int[][] intConstants = new int[VertexShaderInterpreter.NUM_INT_CONSTANTS][4];
+        intConstants[0] = new int[]{4, 0, 1, 0}; // 5 iterações se não houvesse o break
+
+        float[][] output = VertexShaderInterpreter.run(shader, 0, input,
+                new float[VertexShaderInterpreter.NUM_FLOAT_CONSTANTS][4], intConstants,
+                new boolean[VertexShaderInterpreter.NUM_BOOL_CONSTANTS]);
+
+        assertEquals(1f, output[0][0], 1e-6f, "só 1 iteração deveria ter rodado antes do BREAKC sair do laço");
+    }
 }
