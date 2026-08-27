@@ -65,7 +65,7 @@ para a lista completa.
 ## Build
 
 Requer **JBR 25** (JDK do IntelliJ). A `arm-jitter` resolve do Maven Central
-(`dev.vitorsilverio:arm-jitter:1.1.0`):
+(`dev.vitorsilverio:arm-jitter:1.3.0`):
 
 ```sh
 mvn test

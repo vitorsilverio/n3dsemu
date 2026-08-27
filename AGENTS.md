@@ -44,7 +44,7 @@ qualquer coisa aqui, as decisoes D1-D8 la nao devem ser reabertas sem o usuario.
 ## Build e testes
 
 - Compilar e testar com **JBR 25** (a JDK do IntelliJ), nao o JDK 21 do sistema.
-- A `arm-jitter` resolve do **Maven Central** (`dev.vitorsilverio:arm-jitter:1.1.0`), sem
+- A `arm-jitter` resolve do **Maven Central** (`dev.vitorsilverio:arm-jitter:1.3.0`), sem
   `mvn install` local.
 - O agente esta autorizado a rodar build/testes, sempre com o JBR 25 no `JAVA_HOME`.
 
